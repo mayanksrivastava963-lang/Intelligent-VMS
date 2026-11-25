@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node.js
+node_modules/
+dist/
+build/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local video storage
+storage/
+*.mp4
+*.mkv
+*.avi
+*.ts
+
+# AI model weights
+*.pt
+*.pth
+*.onnx
+
+# Database
+postgres_data/
+redis_data/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
