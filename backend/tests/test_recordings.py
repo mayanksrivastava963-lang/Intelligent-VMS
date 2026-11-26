@@ -42,11 +42,30 @@ def sign_in(client):
     assert response.status_code == 200
 
 
+def test_alert_read_and_acknowledge_are_protected(client):
+    from backend.app.models.recordings import alerts
+
+    assert client.get("/api/alerts").status_code == 401
+    sign_in(client)
+    alert_id = "9e8e7339-6881-48cb-b6e9-72b6e98793c6"
+    with client.app.state.engine.begin() as connection:
+        connection.execute(alerts.insert().values(
+            id=alert_id, camera_id="camera-test", rule="intrusion", track_id=1,
+            message="Person entered a restricted zone; review footage", occurred_at=time.time(),
+        ))
+    assert client.get("/api/alerts").json()[0]["id"] == alert_id
+    endpoint = f"/api/alerts/{alert_id}/acknowledge"
+    assert client.post(endpoint).status_code == 403
+    assert client.post(endpoint, headers={"X-VMS-Request": "1"}).json() == {"acknowledged": True}
+    assert client.get("/api/alerts").json()[0]["acknowledged_at"] is not None
+
+
 def test_rtsp_camera_lifecycle_hides_credentials(client):
     from backend.app.models.recordings import rtsp_cameras
 
     headers = {"X-VMS-Request": "1"}
-    payload = {"name": "Entrance", "location": "Lobby", "url": "rtsp://operator:secret@192.168.1.9:554/live"}
+    payload = {"name": "Entrance", "location": "Lobby", "url": "rtsp://operator:secret@192.168.1.9:554/live",
+               "preview_url": "rtsp://operator:preview-secret@192.168.1.9:554/sub"}
     assert client.post("/api/cameras/rtsp", json=payload, headers=headers).status_code == 401
     sign_in(client)
     assert client.post("/api/cameras/rtsp", json={**payload, "url": "file:///secret"}, headers=headers).status_code == 400
@@ -54,6 +73,7 @@ def test_rtsp_camera_lifecycle_hides_credentials(client):
     assert response.status_code == 201
     camera = response.json()
     assert camera["source_type"] == "rtsp"
+    assert camera["has_substream"] is True
     assert camera["status"] == "stopped"
     assert "secret" not in response.text
     camera_id = camera["id"]
@@ -63,6 +83,8 @@ def test_rtsp_camera_lifecycle_hides_credentials(client):
         assert "192.168.1.9" not in row["source_encrypted"]
     assert client.get(f"/api/cameras/{camera_id}/stream").status_code == 409
     assert client.post(f"/api/cameras/{camera_id}/start", headers=headers).json()["status"] == "running"
+    assert client.get("/api/stream-access", headers={"X-Original-URI": f"/live/{camera_id}-preview/index.m3u8"}).status_code == 204
+    assert client.get("/api/stream-access", headers={"X-Original-URI": "/live/not-a-camera/index.m3u8"}).status_code == 403
     assert "secret" not in client.get("/api/cameras").text
     assert client.post(f"/api/cameras/{camera_id}/stop", headers=headers).json()["status"] == "stopped"
     assert client.delete(f"/api/cameras/{camera_id}", headers=headers).status_code == 200

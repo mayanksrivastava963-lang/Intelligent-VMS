@@ -59,6 +59,23 @@ def test_filter_clamp_and_bgr_conversion():
     assert results[0]["confidence"] == pytest.approx(0.8)
 
 
+def test_batched_inference_calls_model_once():
+    detector = module.ObjectDetector.__new__(module.ObjectDetector)
+    detector.device = torch.device("cpu")
+    detector.confidence_threshold = 0.5
+    detector.categories = ["background", "person"]
+    detector.target_objects = {"person"}
+    detector.transform = lambda _image: torch.zeros(3, 10, 20)
+    prediction = {"boxes": torch.tensor([[1, 1, 5, 5]]),
+                  "labels": torch.tensor([1]), "scores": torch.tensor([0.9])}
+    detector.model = Mock(return_value=[prediction, prediction])
+    frames = [np.zeros((10, 20, 3), np.uint8) for _ in range(2)]
+    result = detector.detect_batch(frames)
+    assert len(result) == 2
+    assert result[0][0]["class_name"] == "person"
+    detector.model.assert_called_once()
+
+
 def test_default_model_is_reused(monkeypatch):
     fake = Mock()
     factory = Mock(return_value=fake)

@@ -8,7 +8,11 @@
 storage
 logs
 frontend/dist
-services/ai_engine
+services/ai_engine/.venv
+services/ai_engine/**/*.ipynb
+*.pt
+*.pth
+*.onnx
 *.mp4
 *.avi
 *.mkv

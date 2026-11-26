@@ -1,7 +1,7 @@
 import time
 from uuid import uuid4
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 
 from backend.app.models.recordings import cameras, segments, videos
 
@@ -93,14 +93,29 @@ def fail_job(engine, job, message):
                 status="failed", error=message, updated_at=time.time(), lease_token=None))
 
 
-def list_cameras(engine):
+def list_cameras(engine, limit=None, offset=0):
     with engine.connect() as connection:
-        rows = connection.execute(
+        query = (
             select(cameras, videos.c.filename, videos.c.duration_seconds)
             .join(videos, cameras.c.video_id == videos.c.id)
             .where(videos.c.status == "ready")
             .order_by(cameras.c.created_at)
-        ).mappings()
+        )
+        if limit is not None:
+            query = query.limit(limit).offset(offset)
+        rows = connection.execute(query).mappings().all()
+        video_ids = [row["video_id"] for row in rows]
+        segments_by_video = {video_id: [] for video_id in video_ids}
+        if video_ids:
+            segment_rows = connection.execute(
+                select(segments).where(segments.c.video_id.in_(video_ids))
+                .order_by(segments.c.video_id, segments.c.number)
+            ).mappings()
+            for item in segment_rows:
+                segment = dict(item)
+                segment.pop("relative_path")
+                segment["playback_url"] = f"/api/segments/{segment['id']}/content"
+                segments_by_video[segment["video_id"]].append(segment)
         result = []
         for row in rows:
             camera = {
@@ -113,18 +128,17 @@ def list_cameras(engine):
                 "filename": row["filename"],
                 "duration_seconds": row["duration_seconds"],
             }
-            camera_segments = connection.execute(
-                select(segments).where(segments.c.video_id == camera["video_id"])
-                .order_by(segments.c.number)
-            )
-            camera["segments"] = []
-            for item in camera_segments.mappings():
-                segment = dict(item)
-                segment.pop("relative_path")
-                segment["playback_url"] = f"/api/segments/{segment['id']}/content"
-                camera["segments"].append(segment)
+            camera["segments"] = segments_by_video[camera["video_id"]]
             result.append(camera)
         return result
+
+
+def count_cameras(engine):
+    with engine.connect() as connection:
+        return connection.execute(
+            select(func.count()).select_from(cameras.join(videos))
+            .where(videos.c.status == "ready")
+        ).scalar_one()
 
 
 def create_camera(engine, video_id, name, location=""):

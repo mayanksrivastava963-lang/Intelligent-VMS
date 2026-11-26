@@ -50,12 +50,31 @@ rtsp_cameras = Table(
     Column("name", String(120), nullable=False),
     Column("location", String(200), nullable=False, default=""),
     Column("source_encrypted", String(4096), nullable=False),
+    Column("preview_source_encrypted", String(4096)),
     Column("status", String(20), nullable=False, default="stopped"),
     Column("created_at", Float, nullable=False),
+    Index("ix_rtsp_cameras_created_at", "created_at"),
+    Column("health_status", String(20), nullable=False, default="stopped"),
+    Column("last_frame_at", Float),
 )
 
 camera_ai = Table(
     "camera_ai", metadata,
     Column("camera_id", String(36), primary_key=True),
     Column("enabled", Integer, nullable=False, default=0),
+)
+
+
+alerts = Table(
+    "alerts", metadata,
+    Column("id", String(36), primary_key=True),
+    Column("camera_id", String(36), nullable=False),
+    Column("rule", String(40), nullable=False),
+    Column("track_id", Integer),
+    Column("message", String(240), nullable=False),
+    Column("occurred_at", Float, nullable=False),
+    Column("acknowledged_at", Float),
+    Column("acknowledged_by", String(36)),
+    Index("ix_alerts_occurred_at", "occurred_at"),
+    Index("ix_alerts_camera", "camera_id", "occurred_at"),
 )

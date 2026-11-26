@@ -31,7 +31,7 @@ def validate_frame(frame):
 
 
 class ObjectDetector:
-    """One model per worker; calls on a shared instance are serialized."""
+    """One model per worker; inference accepts a bounded batch of camera frames."""
 
     def __init__(self, confidence_threshold=0.5, device="auto", target_objects=None):
         if not math.isfinite(confidence_threshold) or not 0 <= confidence_threshold <= 1:
@@ -49,22 +49,33 @@ class ObjectDetector:
         if not self.target_objects or not self.target_objects.issubset(self.categories):
             raise ValueError("Target objects must contain supported model category names")
         self.transform = self.weights.transforms()
-        self._lock = Lock()
         self.model = ssdlite320_mobilenet_v3_large(weights=self.weights)
         self.model.to(self.device).eval()
         logger.info("Object detector initialized on %s", self.device)
 
     def detect(self, frame):
-        validate_frame(frame)
+        return self.detect_batch([frame])[0]
+
+    def detect_batch(self, frames):
+        if not 1 <= len(frames) <= 8:
+            raise ValueError("Inference batch must contain 1 to 8 frames")
+        for frame in frames:
+            validate_frame(frame)
+        tensors = []
+        for frame in frames:
+            image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            tensors.append(self.transform(image).to(self.device))
+        with torch.inference_mode():
+            predictions = self.model(tensors)
+        return [self.filter_prediction(frame, prediction)
+                for frame, prediction in zip(frames, predictions)]
+
+    def filter_prediction(self, frame, prediction):
         height, width = frame.shape[:2]
-        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        with self._lock, torch.inference_mode():
-            tensor = self.transform(image).to(self.device)
-            prediction = self.model([tensor])[0]
-            keep = prediction["scores"] >= self.confidence_threshold
-            boxes = prediction["boxes"][keep].cpu().tolist()
-            labels = prediction["labels"][keep].cpu().tolist()
-            scores = prediction["scores"][keep].cpu().tolist()
+        keep = prediction["scores"] >= self.confidence_threshold
+        boxes = prediction["boxes"][keep].cpu().tolist()
+        labels = prediction["labels"][keep].cpu().tolist()
+        scores = prediction["scores"][keep].cpu().tolist()
 
         detections = []
         for box, label, score in zip(boxes, labels, scores):

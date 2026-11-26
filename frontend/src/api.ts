@@ -27,6 +27,7 @@ export type Camera = {
   name: string;
   location: string;
   source_type: "virtual" | "rtsp";
+  has_substream?: boolean;
   status: "running" | "stopped";
   ai_enabled: boolean;
   connection_status?: "connecting" | "online" | "reconnecting" | "offline" | "stopped";
@@ -48,6 +49,14 @@ export type DetectionResult = {
   processed_at: number;
   inference_ms: number;
 };
+export type CameraAlert = {
+  id: string;
+  camera_id: string;
+  rule: string;
+  message: string;
+  occurred_at: number;
+  acknowledged_at: number | null;
+};
 export type Session = {
   authenticated: boolean;
   id: string;
@@ -59,6 +68,7 @@ export type Session = {
   segment_seconds: number;
   max_upload_bytes: number;
   ai_sample_interval_ms: number;
+  streaming_mode: "mediamtx" | "mjpeg";
 };
 
 export type UserAccount = {

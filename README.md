@@ -30,45 +30,45 @@ fullscreen and remove controls. The upload picker accepts multiple files and
 uploads them one at a time. See the camera API and limitations in the
 [recording workspace guide](docs/recording-workspace.md#virtual-camera-dashboard).
 
-## RTSP camera preview
+## RTSP camera preview and recording
 
-In **Live view**, choose **Add RTSP camera**, enter a name, location and the
-authorized `rtsp://` URL, then start the feed. One backend process opens one
-RTSP decoder per camera and shares its latest JPEG frame with authorized
-dashboard viewers. The preview samples up to 10 frames per second and does not
-record the stream. The backend reports connecting, online, reconnecting, or
-offline from decoder activity and frame freshness. A started camera is only a
-requested state. Connections retry after failures. Stopping or removing a
-camera closes its shared acquisition independently of other cameras.
+In **Live view**, choose **Add RTSP camera** and provide its name, location,
+main `rtsp://` URL and optional low-bandwidth substream URL. MediaMTX pulls
+each started source over TCP and serves authenticated same-origin LL-HLS to
+the grid. A grid page contains at most 9 or 16 players. Fullscreen switches
+from the substream to the main stream; the WebRTC button opens a low-latency
+view. Nginx checks the existing session and `camera.read` permission before
+proxying every playlist, media part or WebRTC request. MediaMTX HTTP and
+Control API ports are only available inside the Docker network.
 
-Run the API with one Uvicorn worker for this local in-memory stream hub. A
-multi-process deployment needs an external shared streaming service such as
-MediaMTX and separate access controls. The current MJPEG preview is intended
-for local development and is not a production streaming architecture.
+The separate RTSP recorder runs FFmpeg stream-copy jobs independently of the
+browser and AI worker. Completed MP4 segments appear in the playback library.
+The retention worker prunes completed RTSP recordings after the configured
+age or at low disk space, without deleting active recording run directories.
+Some camera codecs cannot be remuxed to browser-compatible MP4 without
+transcoding; validate each camera's codec before deployment.
 
-RTSP addresses are encrypted in the database using a key derived from
-`VMS_SESSION_SECRET`; keep that secret stable and backed up. Changing it makes
-previously saved camera addresses unreadable and requires re-adding them. URLs
-are excluded from camera API responses. Physical CCTV and RTSP transport testing
-remain pending until a camera or simulated RTSP server is available.
+Local development without `MEDIAMTX_API_URL` retains the bounded shared MJPEG
+preview, with one Uvicorn worker. The Docker stack uses MediaMTX and supports
+multiple API workers. Camera sources stored in the database use Fernet
+encryption; keep `VMS_SESSION_SECRET` stable and backed up. API responses never
+return source URLs or camera passwords. Physical camera validation remains
+pending until authorized hardware is available.
 
 ## AI engine
 
-Each camera card has **Enable AI** / **Disable AI**. The switch is stored in
-the database. While an enabled camera is playing, the browser sends a reduced
-JPEG frame to the authenticated API every two seconds by default. One shared
-SSDLite detector processes a bounded sample at a time; fresh detections are
-drawn briefly over the matching video frame with class, confidence and object
-count. Set `AI_SAMPLE_INTERVAL_MS` in `.env` to change the sampling interval
-(minimum 1000 ms). Paused feeds do not send samples. An AI failure is shown on
-the tile and does not stop video playback.
+Each camera card has **Enable AI** / **Disable AI**. The switch is persistent.
+The optional `ai-worker` samples enabled RTSP cameras, keeps only each camera's
+latest frame, performs bounded batched Torch inference, tracks objects separately
+per camera and stores recent overlays in Redis. Intrusion, loitering and
+unattended-object evaluators create reviewable alerts. Operators can see alerts;
+users with `alerts.manage` can acknowledge them. Intrusion zones are optional
+per-camera pixel polygons in `AI_INTRUSION_ZONES`. Detection is advisory and
+does not classify any person as a threat. Virtual cameras still use local
+authenticated JPEG sampling. Video and recording continue if AI fails.
 
-This initial dashboard inference requires the Python environment to contain
-the dependencies in `services/ai_engine/requirements.txt` and cached model
-weights. The lightweight backend Docker image currently lacks PyTorch and
-OpenCV, so its AI endpoint returns unavailable. Dashboard AI sampling only
-runs while that dashboard is open; background AI analytics and recording are
-separate milestones. See the [AI engine documentation](services/ai_engine/README.md).
+See [60-camera deployment and benchmark guide](docs/scaling-60-cameras.md)
+and [AI engine documentation](services/ai_engine/README.md).
 
 ## Validation
 
@@ -76,9 +76,9 @@ separate milestones. See the [AI engine documentation](services/ai_engine/README
 .\services\ai_engine\.venv\Scripts\python.exe -m pytest backend/tests services/ai_engine/tests -q
 ```
 
-Live-camera recording, retention and production
-deployment validation remain separate milestones. Do not treat this repository
-as a production-certified CCTV system.
+The Docker engine was unavailable during this implementation pass. Container
+deployment, actual RTSP playback, 60-camera load and physical CCTV are not
+verified. Do not treat this repository as a production-certified CCTV system.
 
 See [PROJECT_STATUS.md](PROJECT_STATUS.md) for current implementation progress,
 validation results and known limitations.

@@ -3,9 +3,12 @@
 import base64
 import hashlib
 import io
+import json
 import time
 from threading import Condition, Event, Lock, Thread
 from urllib.parse import urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import av
@@ -30,9 +33,12 @@ def valid_rtsp_url(url):
         return False
 
 
-def list_rtsp_cameras(engine):
+def list_rtsp_cameras(engine, limit=None, offset=0):
     with engine.connect() as connection:
-        rows = connection.execute(select(rtsp_cameras).order_by(rtsp_cameras.c.created_at)).mappings().all()
+        query = select(rtsp_cameras).order_by(rtsp_cameras.c.created_at)
+        if limit is not None:
+            query = query.limit(limit).offset(offset)
+        rows = connection.execute(query).mappings().all()
     return [public_camera(row) for row in rows]
 
 
@@ -42,15 +48,19 @@ def public_camera(row, connection_status=None):
     return {"id": row["id"], "video_id": None, "name": row["name"],
             "location": row["location"], "source_type": "rtsp", "status": row["status"],
             "connection_status": connection_status, "filename": "RTSP camera",
-            "duration_seconds": None, "segments": []}
+            "duration_seconds": None, "segments": [],
+            "has_substream": bool(row["preview_source_encrypted"])}
 
 
-def create_rtsp_camera(engine, secret, name, location, url):
+def create_rtsp_camera(engine, secret, name, location, url, preview_url=""):
     camera_id = str(uuid4())
     with engine.begin() as connection:
         connection.execute(rtsp_cameras.insert().values(
             id=camera_id, name=name, location=location, status="stopped",
-            source_encrypted=cipher(secret).encrypt(url.encode()).decode(), created_at=time.time()))
+            source_encrypted=cipher(secret).encrypt(url.encode()).decode(),
+            preview_source_encrypted=(cipher(secret).encrypt(preview_url.encode()).decode()
+                                      if preview_url else None),
+            created_at=time.time()))
     return camera_id
 
 
@@ -204,3 +214,79 @@ class StreamHub:
             camera_ids = list(self.streams)
         for camera_id in camera_ids:
             self.stop(camera_id)
+
+
+class MediaMTXHub:
+    """Provision RTSP sources once; MediaMTX serves all browser viewers."""
+
+    def __init__(self, engine, secret, api_url, api_user, api_password):
+        self.engine = engine
+        self.secret = secret
+        self.api_url = api_url.rstrip("/")
+        self.authorization = "Basic " + base64.b64encode(
+            f"{api_user}:{api_password}".encode()
+        ).decode()
+
+    def request(self, method, path, data=None):
+        body = None if data is None else json.dumps(data).encode()
+        request = Request(
+            self.api_url + path, data=body, method=method,
+            headers={"Authorization": self.authorization, "Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return json.load(response) if method == "GET" else None
+        except HTTPError as error:
+            if method == "DELETE" and error.code == 404:
+                return None
+            if method == "POST" and error.code == 409:
+                return None
+            raise RuntimeError("Media server configuration is unavailable") from None
+        except (URLError, TimeoutError, OSError, ValueError):
+            raise RuntimeError("Media server is unavailable") from None
+
+    def start(self, camera_id):
+        row = get_rtsp_camera(self.engine, camera_id)
+        if row is None:
+            raise RuntimeError("Camera not found")
+        paths = [(camera_id, row["source_encrypted"])]
+        if row["preview_source_encrypted"]:
+            paths.append((camera_id + "-preview", row["preview_source_encrypted"]))
+        for path_name, encrypted in paths:
+            try:
+                if self.request("GET", f"/v3/config/paths/get/{path_name}"):
+                    continue
+            except RuntimeError:
+                pass
+            source = cipher(self.secret).decrypt(encrypted.encode()).decode()
+            self.request("POST", f"/v3/config/paths/add/{path_name}", {
+                "source": source, "rtspTransport": "tcp", "sourceOnDemand": False,
+            })
+
+    def stop(self, camera_id):
+        self.request("DELETE", f"/v3/config/paths/delete/{camera_id}")
+        self.request("DELETE", f"/v3/config/paths/delete/{camera_id}-preview")
+
+    def restart(self, camera_id):
+        self.stop(camera_id)
+        self.start(camera_id)
+
+    def status(self, camera_id):
+        try:
+            path = self.request("GET", f"/v3/paths/get/{camera_id}")
+            return "online" if path.get("ready") else "reconnecting"
+        except RuntimeError:
+            return "offline"
+
+    def statuses(self, camera_ids):
+        try:
+            paths = self.request("GET", "/v3/paths/list?itemsPerPage=500")
+        except RuntimeError:
+            return {camera_id: "offline" for camera_id in camera_ids}
+        ready = {item["name"]: item.get("ready", False) for item in paths.get("items", [])}
+        return {camera_id: ("online" if ready.get(camera_id) else "reconnecting")
+                for camera_id in camera_ids}
+
+    def close(self):
+        # Paths remain available to other API workers until explicitly stopped.
+        pass

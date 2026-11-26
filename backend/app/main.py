@@ -1,5 +1,6 @@
 import asyncio
 import json
+import ipaddress
 import os
 import re
 import shutil
@@ -11,8 +12,10 @@ from threading import BoundedSemaphore, Lock
 
 import anyio
 import psutil
+from redis import Redis, RedisError
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select, update
@@ -20,17 +23,19 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.app.core.config import load_settings
 from backend.app.services.system_metrics import read_system_metrics
+from backend.app.services.login_limiter import LoginLimiter
 from backend.app.services.camera_ai import (InvalidFrame, detect_jpeg, enabled_camera_ids,
                                             is_enabled, remove_camera_setting, set_enabled)
-from backend.app.services.rtsp import (StreamHub, create_rtsp_camera, get_rtsp_camera,
+from backend.app.services.rtsp import (MediaMTXHub, StreamHub, create_rtsp_camera, get_rtsp_camera,
                                        list_rtsp_cameras, public_camera, update_rtsp_camera,
                                        valid_rtsp_url)
 from backend.app.database.session import create_database
 from backend.app.core.security import hash_password, password_needs_rehash, verify_password
-from backend.app.models.recordings import cameras, segments, videos
+from backend.app.models.recordings import alerts, cameras, segments, videos
 from backend.app.models.users import audit_logs, user_sessions, users as users_table
 from backend.app.services.recordings import (
     create_camera,
+    count_cameras,
     delete_camera,
     get_video,
     list_cameras,
@@ -54,6 +59,19 @@ COOKIE = "vms_session"
 ALLOWED_EXTENSIONS = {"mp4", "mov", "mkv", "avi", "webm", "m4v"}
 
 
+def client_address(request):
+    address = request.client.host if request.client else "unknown"
+    try:
+        client_ip = ipaddress.ip_address(address)
+        for cidr in request.app.state.settings.get("trusted_proxy_cidrs", []):
+            if client_ip in ipaddress.ip_network(cidr):
+                forwarded = request.headers.get("x-real-ip", "")
+                return str(ipaddress.ip_address(forwarded)) if forwarded else address
+    except ValueError:
+        pass
+    return address
+
+
 class CameraRequest(BaseModel):
     video_id: str = Field(min_length=1, max_length=36)
     name: str = Field(min_length=1, max_length=120)
@@ -64,6 +82,7 @@ class RTSPCameraRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     location: str = Field(default="", max_length=200)
     url: str = Field(repr=False)
+    preview_url: str = Field(default="", repr=False)
 
 
 class CameraAIRequest(BaseModel):
@@ -97,8 +116,21 @@ def create_app(settings=None):
             app.state.settings["operator_password_hash"] = hash_password(
                 app.state.settings["password"]
             )
-        app.state.engine = create_database(app.state.settings["database_url"])
-        app.state.stream_hub = StreamHub(app.state.engine, app.state.settings["session_secret"])
+        app.state.engine = create_database(
+            app.state.settings["database_url"],
+            app.state.settings.get("db_pool_size", 5),
+            app.state.settings.get("db_max_overflow", 5),
+            app.state.settings.get("db_pool_recycle", 1800),
+        )
+        media_url = app.state.settings.get("mediamtx_api_url")
+        if media_url:
+            app.state.stream_hub = MediaMTXHub(
+                app.state.engine, app.state.settings["session_secret"], media_url,
+                app.state.settings["mediamtx_api_user"],
+                app.state.settings["mediamtx_api_password"],
+            )
+        else:
+            app.state.stream_hub = StreamHub(app.state.engine, app.state.settings["session_secret"])
         initialize_user_database(
             app.state.engine,
             app.state.settings["operator_username"],
@@ -106,7 +138,10 @@ def create_app(settings=None):
             app.state.settings.get("password", ""),
         )
         app.state.signer = URLSafeTimedSerializer(app.state.settings["session_secret"], salt="vms-operator")
-        app.state.login_attempts = {}
+        app.state.login_limiter = LoginLimiter(app.state.settings.get("redis_url"))
+        app.state.ai_results = (Redis.from_url(app.state.settings["redis_url"],
+                                                socket_connect_timeout=2, socket_timeout=2)
+                                if app.state.settings.get("redis_url") else None)
         app.state.metrics_lock = Lock()
         app.state.inference_slot = BoundedSemaphore(1)
         app.state.ai_sample_lock = Lock()
@@ -116,7 +151,10 @@ def create_app(settings=None):
         app.state.dummy_password_hash = hash_password(os.urandom(32).hex())
         for camera in list_rtsp_cameras(app.state.engine):
             if camera["status"] == "running":
-                app.state.stream_hub.start(camera["id"])
+                try:
+                    app.state.stream_hub.start(camera["id"])
+                except RuntimeError:
+                    pass
         try:
             yield
         finally:
@@ -124,6 +162,11 @@ def create_app(settings=None):
             app.state.engine.dispose()
 
     app = FastAPI(title="Intelligent VMS API", lifespan=lifespan, redoc_url=None)
+
+    @app.exception_handler(RequestValidationError)
+    async def hide_validation_input(_request, _error):
+        # Pydantic's default 422 includes submitted field values, including RTSP credentials.
+        return JSONResponse(status_code=422, content={"detail": "Invalid request fields"})
 
     def require_operator(request: Request):
         try:
@@ -184,16 +227,13 @@ def create_app(settings=None):
 
     @app.post("/api/auth/login", dependencies=[Depends(require_write_header)])
     async def login(request: Request, response: Response):
-        address = request.client.host if request.client else "unknown"
-        attempts = request.app.state.login_attempts
-        now = time.monotonic()
-        for key in list(attempts):
-            if attempts[key][1] < now - 60:
-                del attempts[key]
-        count, first = attempts.get(address, (0, now))
-        if count >= 5 or len(attempts) >= 1024:
+        address = client_address(request)
+        try:
+            allowed = request.app.state.login_limiter.allow(address)
+        except RuntimeError:
+            raise HTTPException(503, "Sign-in service is temporarily unavailable") from None
+        if not allowed:
             raise HTTPException(429, "Too many sign-in attempts. Wait one minute.")
-        attempts[address] = (count + 1, first)
         body = bytearray()
         async for chunk in request.stream():
             body.extend(chunk)
@@ -214,7 +254,7 @@ def create_app(settings=None):
             with request.app.state.engine.begin() as connection:
                 add_audit(connection, "login_failed", outcome="invalid_credentials", remote_address=address)
             raise HTTPException(401, "Incorrect username or password")
-        attempts.pop(address, None)
+        request.app.state.login_limiter.clear(address)
         now = time.time()
         session_id = str(uuid4())
         if password_needs_rehash(password_hash):
@@ -246,7 +286,8 @@ def create_app(settings=None):
                 "role_name": user["role_name"], "permissions": user["permissions"],
                 "segment_seconds": config["segment_seconds"],
                 "max_upload_bytes": config["max_upload_bytes"],
-                "ai_sample_interval_ms": config.get("ai_sample_interval_ms", 2000)}
+                "ai_sample_interval_ms": config.get("ai_sample_interval_ms", 2000),
+                "streaming_mode": "mediamtx" if config.get("mediamtx_api_url") else "mjpeg"}
 
     @app.post("/api/auth/logout", dependencies=[Depends(require_write_header), Depends(require_operator)])
     def logout(request: Request, response: Response):
@@ -456,25 +497,49 @@ def create_app(settings=None):
         return get_video(engine, video_id)
 
     @app.get("/api/cameras", dependencies=[Depends(require_permission("camera.read"))])
-    def cameras_index(request: Request):
+    def cameras_index(request: Request, limit: int = 100, offset: int = 0):
+        if not 1 <= limit <= 500 or offset < 0:
+            raise HTTPException(400, "Invalid pagination")
         enabled = enabled_camera_ids(request.app.state.engine)
-        virtual = list_cameras(request.app.state.engine)
-        physical = list_rtsp_cameras(request.app.state.engine)
+        engine = request.app.state.engine
+        virtual_total = count_cameras(engine)
+        virtual_limit = max(0, min(limit, virtual_total - offset))
+        virtual = list_cameras(engine, virtual_limit, offset) if virtual_limit else []
+        physical_limit = limit - len(virtual)
+        physical_offset = max(0, offset - virtual_total)
+        physical = list_rtsp_cameras(engine, physical_limit, physical_offset) if physical_limit else []
+        running_ids = [camera["id"] for camera in physical if camera["status"] == "running"]
+        hub = request.app.state.stream_hub
+        statuses = hub.statuses(running_ids) if isinstance(hub, MediaMTXHub) else None
         for camera in physical:
             if camera["status"] == "running":
-                camera["connection_status"] = request.app.state.stream_hub.status(camera["id"])
+                camera["connection_status"] = statuses[camera["id"]] if statuses is not None else hub.status(camera["id"])
         for camera in virtual + physical:
             camera["ai_enabled"] = camera["id"] in enabled
         return virtual + physical
+
+    @app.get("/api/stream-access", dependencies=[Depends(require_permission("camera.read"))])
+    def stream_access(request: Request):
+        # Nginx auth_request passes the original URI; no media URLs or credentials leave the API.
+        original = request.headers.get("x-original-uri", "")
+        match = re.match(r"^/live(?:-webrtc)?/([0-9a-f-]{36})(?:-preview)?(?:/|\?|$)", original)
+        if not match:
+            raise HTTPException(403, "Stream access denied")
+        camera = get_rtsp_camera(request.app.state.engine, match.group(1))
+        if not camera or camera["status"] != "running":
+            raise HTTPException(403, "Stream access denied")
+        return Response(status_code=204)
 
     @app.post("/api/cameras/rtsp", status_code=201,
               dependencies=[Depends(require_permission("camera.manage")), Depends(require_write_header)])
     def add_rtsp_camera(body: RTSPCameraRequest, request: Request):
         if not body.name.strip() or len(body.url) > 2000 or not valid_rtsp_url(body.url):
             raise HTTPException(400, "Enter a camera name and a valid rtsp:// URL")
+        if body.preview_url and (len(body.preview_url) > 2000 or not valid_rtsp_url(body.preview_url)):
+            raise HTTPException(400, "Enter a valid rtsp:// substream URL")
         engine = request.app.state.engine
         camera_id = create_rtsp_camera(engine, request.app.state.settings["session_secret"],
-                                       body.name.strip(), body.location.strip(), body.url)
+                                       body.name.strip(), body.location.strip(), body.url, body.preview_url)
         return {**public_camera(get_rtsp_camera(engine, camera_id)), "ai_enabled": False}
 
     @app.get("/api/cameras/{camera_id}/stream", dependencies=[Depends(require_permission("camera.read"))])
@@ -485,6 +550,8 @@ def create_app(settings=None):
             raise HTTPException(404, "Camera not found")
         if camera["status"] != "running":
             raise HTTPException(409, "Camera is stopped")
+        if isinstance(request.app.state.stream_hub, MediaMTXHub):
+            raise HTTPException(410, "Use the authenticated HLS live stream")
         signed_session = request.cookies.get(COOKIE, "")
 
         def session_valid():
@@ -521,12 +588,16 @@ def create_app(settings=None):
         if get_rtsp_camera(engine, camera_id):
             update_rtsp_camera(engine, camera_id, status)
             hub = request.app.state.stream_hub
-            if action == "stop":
-                hub.stop(camera_id)
-            elif action == "restart":
-                hub.restart(camera_id)
-            else:
-                hub.start(camera_id)
+            try:
+                if action == "stop":
+                    hub.stop(camera_id)
+                elif action == "restart":
+                    hub.restart(camera_id)
+                else:
+                    hub.start(camera_id)
+            except RuntimeError:
+                update_rtsp_camera(engine, camera_id, "stopped")
+                raise HTTPException(503, "Media server is temporarily unavailable") from None
             return {**public_camera(get_rtsp_camera(engine, camera_id), hub.status(camera_id)),
                     "ai_enabled": is_enabled(engine, camera_id)}
         if not set_camera_status(request.app.state.engine, camera_id, status):
@@ -539,7 +610,10 @@ def create_app(settings=None):
     def remove_camera(camera_id: str, request: Request):
         state = request.app.state
         if update_rtsp_camera(request.app.state.engine, camera_id):
-            state.stream_hub.stop(camera_id)
+            try:
+                state.stream_hub.stop(camera_id)
+            except RuntimeError:
+                pass
             remove_camera_setting(request.app.state.engine, camera_id)
             with state.ai_sample_lock:
                 state.ai_sample_times.pop(camera_id, None)
@@ -563,9 +637,50 @@ def create_app(settings=None):
         set_enabled(engine, camera_id, body.enabled)
         return {"camera_id": camera_id, "ai_enabled": body.enabled}
 
+    @app.get("/api/cameras/{camera_id}/ai/detections",
+             dependencies=[Depends(require_permission("camera.read"))])
+    def latest_camera_detections(camera_id: str, request: Request):
+        if not is_enabled(request.app.state.engine, camera_id):
+            raise HTTPException(409, "AI is not enabled for this camera")
+        redis = request.app.state.ai_results
+        if redis is None:
+            raise HTTPException(503, "AI worker is not configured")
+        try:
+            result = redis.get("vms:ai:" + camera_id)
+        except RedisError:
+            raise HTTPException(503, "AI results are temporarily unavailable") from None
+        if result is None:
+            return {"width": 0, "height": 0, "detections": [],
+                    "processed_at": 0, "inference_ms": 0}
+        return json.loads(result)
+
+    @app.get("/api/alerts", dependencies=[Depends(require_permission("alerts.read"))])
+    def alerts_index(request: Request, limit: int = 100, offset: int = 0, camera_id: str | None = None):
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(400, "Invalid pagination")
+        query = select(alerts).order_by(alerts.c.occurred_at.desc()).limit(limit).offset(offset)
+        if camera_id:
+            query = query.where(alerts.c.camera_id == camera_id)
+        with request.app.state.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(query).mappings()]
+
+    @app.post("/api/alerts/{alert_id}/acknowledge",
+              dependencies=[Depends(require_permission("alerts.manage")), Depends(require_write_header)])
+    def acknowledge_alert(alert_id: str, request: Request):
+        with request.app.state.engine.begin() as connection:
+            result = connection.execute(update(alerts).where(
+                alerts.c.id == alert_id, alerts.c.acknowledged_at.is_(None)
+            ).values(acknowledged_at=time.time(), acknowledged_by=request.state.user["id"]))
+            if result.rowcount != 1:
+                raise HTTPException(404, "Unreviewed alert not found")
+            add_audit(connection, "alert_acknowledged", actor_user_id=request.state.user["id"])
+        return {"acknowledged": True}
+
     @app.post("/api/cameras/{camera_id}/ai/detections",
               dependencies=[Depends(require_permission("camera.read")), Depends(require_write_header)])
     async def camera_detections(camera_id: str, request: Request):
+        if request.app.state.ai_results is not None:
+            raise HTTPException(409, "Use the AI worker results endpoint")
         engine = request.app.state.engine
         camera = get_rtsp_camera(engine, camera_id)
         if camera is None:

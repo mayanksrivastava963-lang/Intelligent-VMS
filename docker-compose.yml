@@ -33,16 +33,20 @@ services:
       retries: 5
 
   mediamtx:
-    image: bluenviron/mediamtx:1
+    image: bluenviron/mediamtx:1.21.4
     restart: unless-stopped
     environment:
-      MTX_RTSPTRANSPORTS: tcp
-      MTX_WEBRTCADDITIONALHOSTS: 127.0.0.1
+      MTX_AUTHINTERNALUSERS_0_PASS: ${MEDIAMTX_API_PASSWORD:?Set MEDIAMTX_API_PASSWORD}
+      MTX_WEBRTCADDITIONALHOSTS: ${VMS_PUBLIC_HOST:-127.0.0.1}
+    volumes:
+      - ./infrastructure/mediamtx/mediamtx.yml:/mediamtx.yml:ro
     ports:
-      - "127.0.0.1:8554:8554"
-      - "127.0.0.1:8888:8888"
-      - "127.0.0.1:8889:8889"
-      - "127.0.0.1:8189:8189/udp"
+      - "8189:8189/udp"
+    expose:
+      - "8554"
+      - "8888"
+      - "8889"
+      - "9997"
 
 volumes:
   postgres_data:

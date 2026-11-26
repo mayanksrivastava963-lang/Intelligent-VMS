@@ -1,0 +1,6 @@
+name: intelligent-vms
+
+services:
+  mediamtx:
+    ports:
+      - "127.0.0.1:8554:8554"
