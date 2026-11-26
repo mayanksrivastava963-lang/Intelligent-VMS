@@ -7,7 +7,7 @@ import time
 from contextlib import asynccontextmanager
 from urllib.parse import unquote
 from uuid import uuid4
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 
 import anyio
 import psutil
@@ -20,11 +20,14 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.app.core.config import load_settings
 from backend.app.services.system_metrics import read_system_metrics
-from backend.app.services.rtsp import (create_rtsp_camera, get_rtsp_camera, list_rtsp_cameras,
-                                       mjpeg_stream, public_camera, update_rtsp_camera, valid_rtsp_url)
+from backend.app.services.camera_ai import (InvalidFrame, detect_jpeg, enabled_camera_ids,
+                                            is_enabled, remove_camera_setting, set_enabled)
+from backend.app.services.rtsp import (StreamHub, create_rtsp_camera, get_rtsp_camera,
+                                       list_rtsp_cameras, public_camera, update_rtsp_camera,
+                                       valid_rtsp_url)
 from backend.app.database.session import create_database
 from backend.app.core.security import hash_password, password_needs_rehash, verify_password
-from backend.app.models.recordings import segments, videos
+from backend.app.models.recordings import cameras, segments, videos
 from backend.app.models.users import audit_logs, user_sessions, users as users_table
 from backend.app.services.recordings import (
     create_camera,
@@ -63,6 +66,10 @@ class RTSPCameraRequest(BaseModel):
     url: str = Field(repr=False)
 
 
+class CameraAIRequest(BaseModel):
+    enabled: bool
+
+
 class UserCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
     username: str = Field(min_length=3, max_length=64)
@@ -91,6 +98,7 @@ def create_app(settings=None):
                 app.state.settings["password"]
             )
         app.state.engine = create_database(app.state.settings["database_url"])
+        app.state.stream_hub = StreamHub(app.state.engine, app.state.settings["session_secret"])
         initialize_user_database(
             app.state.engine,
             app.state.settings["operator_username"],
@@ -100,11 +108,20 @@ def create_app(settings=None):
         app.state.signer = URLSafeTimedSerializer(app.state.settings["session_secret"], salt="vms-operator")
         app.state.login_attempts = {}
         app.state.metrics_lock = Lock()
+        app.state.inference_slot = BoundedSemaphore(1)
+        app.state.ai_sample_lock = Lock()
+        app.state.ai_sample_times = {}
         app.state.metrics_cache = None
         app.state.metrics_sample_time = 0
         app.state.dummy_password_hash = hash_password(os.urandom(32).hex())
-        yield
-        app.state.engine.dispose()
+        for camera in list_rtsp_cameras(app.state.engine):
+            if camera["status"] == "running":
+                app.state.stream_hub.start(camera["id"])
+        try:
+            yield
+        finally:
+            app.state.stream_hub.close()
+            app.state.engine.dispose()
 
     app = FastAPI(title="Intelligent VMS API", lifespan=lifespan, redoc_url=None)
 
@@ -228,7 +245,8 @@ def create_app(settings=None):
                 "full_name": user["full_name"], "role": user["role_id"],
                 "role_name": user["role_name"], "permissions": user["permissions"],
                 "segment_seconds": config["segment_seconds"],
-                "max_upload_bytes": config["max_upload_bytes"]}
+                "max_upload_bytes": config["max_upload_bytes"],
+                "ai_sample_interval_ms": config.get("ai_sample_interval_ms", 2000)}
 
     @app.post("/api/auth/logout", dependencies=[Depends(require_write_header), Depends(require_operator)])
     def logout(request: Request, response: Response):
@@ -439,7 +457,15 @@ def create_app(settings=None):
 
     @app.get("/api/cameras", dependencies=[Depends(require_permission("camera.read"))])
     def cameras_index(request: Request):
-        return list_cameras(request.app.state.engine) + list_rtsp_cameras(request.app.state.engine)
+        enabled = enabled_camera_ids(request.app.state.engine)
+        virtual = list_cameras(request.app.state.engine)
+        physical = list_rtsp_cameras(request.app.state.engine)
+        for camera in physical:
+            if camera["status"] == "running":
+                camera["connection_status"] = request.app.state.stream_hub.status(camera["id"])
+        for camera in virtual + physical:
+            camera["ai_enabled"] = camera["id"] in enabled
+        return virtual + physical
 
     @app.post("/api/cameras/rtsp", status_code=201,
               dependencies=[Depends(require_permission("camera.manage")), Depends(require_write_header)])
@@ -449,7 +475,7 @@ def create_app(settings=None):
         engine = request.app.state.engine
         camera_id = create_rtsp_camera(engine, request.app.state.settings["session_secret"],
                                        body.name.strip(), body.location.strip(), body.url)
-        return public_camera(get_rtsp_camera(engine, camera_id))
+        return {**public_camera(get_rtsp_camera(engine, camera_id)), "ai_enabled": False}
 
     @app.get("/api/cameras/{camera_id}/stream", dependencies=[Depends(require_permission("camera.read"))])
     def camera_stream(camera_id: str, request: Request):
@@ -469,7 +495,7 @@ def create_app(settings=None):
             except (BadSignature, SignatureExpired):
                 return False
 
-        return StreamingResponse(mjpeg_stream(engine, camera_id, request.app.state.settings["session_secret"], session_valid),
+        return StreamingResponse(request.app.state.stream_hub.frames(camera_id, session_valid),
                                  media_type="multipart/x-mixed-replace; boundary=frame",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
@@ -483,7 +509,8 @@ def create_app(settings=None):
         camera_id = create_camera(request.app.state.engine, body.video_id, name, location)
         if camera_id is None:
             raise HTTPException(409, "Choose a recording that is ready to play")
-        return next(camera for camera in list_cameras(request.app.state.engine) if camera["id"] == camera_id)
+        return {**next(camera for camera in list_cameras(request.app.state.engine) if camera["id"] == camera_id),
+                "ai_enabled": False}
 
     @app.post("/api/cameras/{camera_id}/{action}", dependencies=[Depends(require_permission("camera.manage")), Depends(require_write_header)])
     def camera_action(camera_id: str, action: str, request: Request):
@@ -493,18 +520,90 @@ def create_app(settings=None):
         engine = request.app.state.engine
         if get_rtsp_camera(engine, camera_id):
             update_rtsp_camera(engine, camera_id, status)
-            return public_camera(get_rtsp_camera(engine, camera_id))
+            hub = request.app.state.stream_hub
+            if action == "stop":
+                hub.stop(camera_id)
+            elif action == "restart":
+                hub.restart(camera_id)
+            else:
+                hub.start(camera_id)
+            return {**public_camera(get_rtsp_camera(engine, camera_id), hub.status(camera_id)),
+                    "ai_enabled": is_enabled(engine, camera_id)}
         if not set_camera_status(request.app.state.engine, camera_id, status):
             raise HTTPException(404, "Camera not found")
-        return next(camera for camera in list_cameras(request.app.state.engine) if camera["id"] == camera_id)
+        camera = next(camera for camera in list_cameras(request.app.state.engine) if camera["id"] == camera_id)
+        camera["ai_enabled"] = is_enabled(request.app.state.engine, camera_id)
+        return camera
 
     @app.delete("/api/cameras/{camera_id}", dependencies=[Depends(require_permission("camera.manage")), Depends(require_write_header)])
     def remove_camera(camera_id: str, request: Request):
+        state = request.app.state
         if update_rtsp_camera(request.app.state.engine, camera_id):
+            state.stream_hub.stop(camera_id)
+            remove_camera_setting(request.app.state.engine, camera_id)
+            with state.ai_sample_lock:
+                state.ai_sample_times.pop(camera_id, None)
             return {"deleted": True}
         if not delete_camera(request.app.state.engine, camera_id):
             raise HTTPException(404, "Camera not found")
+        remove_camera_setting(request.app.state.engine, camera_id)
+        with state.ai_sample_lock:
+            state.ai_sample_times.pop(camera_id, None)
         return {"deleted": True}
+
+    @app.put("/api/cameras/{camera_id}/ai",
+             dependencies=[Depends(require_permission("camera.manage")), Depends(require_write_header)])
+    def camera_ai_switch(camera_id: str, body: CameraAIRequest, request: Request):
+        engine = request.app.state.engine
+        if not get_rtsp_camera(engine, camera_id):
+            with engine.connect() as connection:
+                exists = connection.execute(select(cameras.c.id).where(cameras.c.id == camera_id)).first()
+            if exists is None:
+                raise HTTPException(404, "Camera not found")
+        set_enabled(engine, camera_id, body.enabled)
+        return {"camera_id": camera_id, "ai_enabled": body.enabled}
+
+    @app.post("/api/cameras/{camera_id}/ai/detections",
+              dependencies=[Depends(require_permission("camera.read")), Depends(require_write_header)])
+    async def camera_detections(camera_id: str, request: Request):
+        engine = request.app.state.engine
+        camera = get_rtsp_camera(engine, camera_id)
+        if camera is None:
+            with engine.connect() as connection:
+                camera = connection.execute(
+                    select(cameras.c.status).where(cameras.c.id == camera_id)
+                ).mappings().first()
+        if camera is None:
+            raise HTTPException(404, "Camera not found")
+        if camera["status"] != "running" or not is_enabled(engine, camera_id):
+            raise HTTPException(409, "Start the camera and enable AI first")
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > 600_000:
+                raise HTTPException(413, "Sample frame is too large")
+        if not data:
+            raise HTTPException(400, "JPEG frame is required")
+        state = request.app.state
+        with state.ai_sample_lock:
+            now = time.monotonic()
+            if now - state.ai_sample_times.get(camera_id, 0) < 1:
+                raise HTTPException(429, "Wait before sending another AI sample")
+            state.ai_sample_times[camera_id] = now
+        if not state.inference_slot.acquire(blocking=False):
+            raise HTTPException(429, "AI processor is busy")
+        try:
+            started = time.perf_counter()
+            result = await anyio.to_thread.run_sync(detect_jpeg, bytes(data))
+            result["processed_at"] = time.time()
+            result["inference_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+        except InvalidFrame as error:
+            raise HTTPException(400, str(error)) from None
+        except Exception:
+            raise HTTPException(503, "AI processing is temporarily unavailable") from None
+        finally:
+            state.inference_slot.release()
 
     @app.get("/api/segments/{segment_id}/content", dependencies=[Depends(require_permission("recording.read"))])
     def content(segment_id: str, request: Request):

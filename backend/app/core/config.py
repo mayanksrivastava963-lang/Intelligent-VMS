@@ -42,6 +42,7 @@ def load_settings():
         "segment_seconds": int(os.getenv("RECORDING_SEGMENT_SECONDS", "1800")),
         "job_timeout_seconds": int(os.getenv("JOB_TIMEOUT_SECONDS", "86400")),
         "ffmpeg_threads": int(os.getenv("FFMPEG_THREADS", "2")),
+        "ai_sample_interval_ms": int(os.getenv("AI_SAMPLE_INTERVAL_MS", "2000")),
         "frontend_dist": Path(os.getenv("FRONTEND_DIST", str(ROOT / "frontend" / "dist"))),
     }
     for key in ("max_upload_bytes", "segment_seconds", "job_timeout_seconds", "ffmpeg_threads"):
@@ -49,5 +50,7 @@ def load_settings():
             raise RuntimeError(f"{key} must be positive")
     if settings["min_free_bytes"] < 0:
         raise RuntimeError("min_free_bytes must not be negative")
+    if settings["ai_sample_interval_ms"] < 1000:
+        raise RuntimeError("ai_sample_interval_ms must be at least 1000")
     storage.mkdir(parents=True, exist_ok=True)
     return settings

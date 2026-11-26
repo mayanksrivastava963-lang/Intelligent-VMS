@@ -5,7 +5,7 @@ import CommandPalette, { buildCommandItems } from "./components/CommandPalette";
 import Icon from "./components/Icon";
 import LoginPage from "./components/LoginPage";
 import SystemMonitor from "./components/SystemMonitor";
-import type { AccessRole, AuditEvent, Camera, Recording, RecordingDetail, Segment, Session, UserAccount } from "./api";
+import type { AccessRole, AuditEvent, Camera, DetectionResult, Recording, RecordingDetail, Segment, Session, UserAccount } from "./api";
 
 type UserDialog = {
   mode: "create" | "edit" | "password";
@@ -50,25 +50,100 @@ function CameraFeed({
   onControl,
   onRemove,
   onSnapshot,
+  onToggleAI,
+  canManage,
+  sampleIntervalMs,
 }: {
   camera: Camera & { playback_revision?: number };
   index?: number;
   onControl: (action: "start" | "stop" | "restart") => void;
   onRemove: () => void;
   onSnapshot: (message: string) => void;
+  onToggleAI: () => void;
+  canManage: boolean;
+  sampleIntervalMs: number;
 }) {
   const [segmentIndex, setSegmentIndex] = useState(0);
+  const [playbackCycle, setPlaybackCycle] = useState(0);
   const [loop, setLoop] = useState(true);
   const video = useRef<HTMLVideoElement>(null);
+  const streamImage = useRef<HTMLImageElement>(null);
   const screen = useRef<HTMLDivElement>(null);
-  const [streamLoaded, setStreamLoaded] = useState(false);
+  const [streamError, setStreamError] = useState(false);
+  const [playbackState, setPlaybackState] = useState<"loading" | "playing" | "paused">("loading");
+  const [aiResult, setAiResult] = useState<DetectionResult | null>(null);
+  const [aiError, setAiError] = useState("");
   const currentSegment = camera.segments[segmentIndex];
+  const feedState = camera.status === "stopped" ? "stopped"
+    : camera.source_type === "rtsp" ? (streamError ? "error" : camera.connection_status ?? "connecting")
+    : playbackState;
+
+  useEffect(() => {
+    setStreamError(false);
+    setPlaybackState("loading");
+    setAiResult(null);
+  }, [camera.id, camera.status, camera.playback_revision]);
+
+  useEffect(() => {
+    setAiResult(null);
+    setAiError("");
+    if (!camera.ai_enabled || camera.status !== "running") return;
+    let cancelled = false;
+    let busy = false;
+    let clearResult: number | undefined;
+
+    async function sampleFrame() {
+      if (busy || cancelled) return;
+      if (camera.source_type === "rtsp" && camera.connection_status !== "online") return;
+      if (camera.source_type === "virtual" && video.current?.paused) return;
+      const source = camera.source_type === "virtual" ? video.current : streamImage.current;
+      const width = source instanceof HTMLVideoElement ? source.videoWidth : source?.naturalWidth ?? 0;
+      const height = source instanceof HTMLVideoElement ? source.videoHeight : source?.naturalHeight ?? 0;
+      if (!source || !width || !height) return;
+      busy = true;
+      const capturedAt = Date.now();
+      const videoTime = video.current?.currentTime ?? 0;
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.min(width, 640);
+        canvas.height = Math.round((canvas.width * height) / width);
+        canvas.getContext("2d")?.drawImage(source, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.78));
+        if (!blob || cancelled) return;
+        const result = await api<DetectionResult>(`/cameras/${camera.id}/ai/detections`, {
+          method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob,
+        });
+        if (cancelled || Date.now() - capturedAt > 1500) return;
+        if (camera.source_type === "virtual" && Math.abs((video.current?.currentTime ?? 0) - videoTime) > 0.8) return;
+        setAiResult(result);
+        setAiError("");
+        window.clearTimeout(clearResult);
+        clearResult = window.setTimeout(() => setAiResult(null), 1100);
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : "AI unavailable";
+        if (!cancelled && !message.includes("AI processor is busy") && !message.includes("Wait before"))
+          setAiError("AI unavailable");
+      } finally {
+        busy = false;
+      }
+    }
+
+    const initial = window.setTimeout(() => void sampleFrame(), 500);
+    const timer = window.setInterval(() => void sampleFrame(), sampleIntervalMs);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(initial);
+      window.clearTimeout(clearResult);
+      window.clearInterval(timer);
+    };
+  }, [camera.ai_enabled, camera.connection_status, camera.id, camera.source_type, camera.status, camera.playback_revision, sampleIntervalMs]);
 
   function playNextSegment() {
     if (segmentIndex + 1 < camera.segments.length) {
       setSegmentIndex(segmentIndex + 1);
     } else if (loop) {
       setSegmentIndex(0);
+      setPlaybackCycle((current) => current + 1);
     }
   }
 
@@ -104,16 +179,19 @@ function CameraFeed({
     >
       <div className="camera-screen" ref={screen}>
         {camera.status === "running" && camera.source_type === "rtsp" ? (
-          <><img className="rtsp-stream" src={`/api/cameras/${camera.id}/stream?revision=${camera.playback_revision ?? 0}`} alt={`${camera.name} live feed`} onLoad={() => setStreamLoaded(true)} onError={() => setStreamLoaded(false)} />{!streamLoaded && <div className="rtsp-connecting">Connecting to camera…</div>}</>
+          <><img ref={streamImage} className="rtsp-stream" src={`/api/cameras/${camera.id}/stream?revision=${camera.playback_revision ?? 0}`} alt={`${camera.name} live feed`} onLoad={() => setStreamError(false)} onError={() => setStreamError(true)} />{feedState !== "online" && <div className="rtsp-connecting">{feedState === "offline" ? "Camera offline · retrying" : feedState === "reconnecting" ? "Reconnecting to camera…" : feedState === "error" ? "Preview unavailable" : "Connecting to camera…"}</div>}</>
         ) : camera.status === "running" && currentSegment ? (
           <video
             ref={video}
-            key={`${camera.id}-${camera.playback_revision ?? 0}-${segmentIndex}`}
+            key={`${camera.id}-${camera.playback_revision ?? 0}-${segmentIndex}-${playbackCycle}`}
             src={currentSegment.playback_url}
             autoPlay
             muted
             controls
             playsInline
+            onPlaying={() => setPlaybackState("playing")}
+            onWaiting={() => setPlaybackState("loading")}
+            onPause={() => setPlaybackState("paused")}
             onEnded={playNextSegment}
             onError={() => onControl("stop")}
           />
@@ -124,8 +202,17 @@ function CameraFeed({
             <small>{camera.filename}</small>
           </div>
         )}
-        <span className={`camera-live ${camera.status}`}>
-          <i /> {camera.status === "running" ? camera.source_type === "rtsp" ? (streamLoaded ? "LIVE" : "CONNECTING") : "SIMULATED LIVE" : "STOPPED"}
+        {camera.ai_enabled && aiResult && <svg className="detection-overlay" viewBox={`0 0 ${aiResult.width} ${aiResult.height}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label={`${aiResult.detections.length} detected objects`}>
+          {aiResult.detections.map((detection, detectionIndex) => {
+            const [x1, y1, x2, y2] = detection.bbox;
+            return <g key={detectionIndex}>
+              <rect x={x1} y={y1} width={x2 - x1} height={y2 - y1} />
+              <text x={x1} y={Math.max(16, y1 - 5)}>{detection.class_name} {Math.round(detection.confidence * 100)}%</text>
+            </g>;
+          })}
+        </svg>}
+        <span className={`camera-live ${feedState}`}>
+          <i /> {feedState === "online" ? "LIVE" : feedState === "playing" ? "SIMULATED LIVE" : feedState.toUpperCase()}
         </span>
         {camera.status === "running" && (
           <>
@@ -142,6 +229,7 @@ function CameraFeed({
             </button>
           </>
         )}
+        {camera.ai_enabled && <span className="ai-indicator">{aiError || `AI ON · ${aiResult?.detections.length ?? 0} objects`}</span>}
       </div>
       <div className="camera-card-info">
         <div>
@@ -151,14 +239,15 @@ function CameraFeed({
         <span className="camera-id">{camera.id.slice(0, 8).toUpperCase()}</span>
       </div>
       <div className="camera-card-actions">
-        {camera.status === "running" ? (
+        {canManage && (camera.status === "running" ? (
           <button className="secondary" onClick={() => onControl("stop")}>Stop</button>
         ) : (
           <button className="secondary" onClick={() => onControl("start")}>Start feed</button>
-        )}
-        <button className="text-button" onClick={() => onControl("restart")}>Restart</button>
+        ))}
+        {canManage && <button className="text-button" onClick={() => onControl("restart")}>Restart</button>}
+        {canManage && <button className="text-button" onClick={onToggleAI}>{camera.ai_enabled ? "Disable AI" : "Enable AI"}</button>}
         {camera.source_type === "virtual" && <label className="loop-toggle"><input type="checkbox" checked={loop} onChange={(event) => setLoop(event.target.checked)} /> Loop</label>}
-        <button className="remove-camera" onClick={onRemove} title="Remove camera" aria-label={`Remove ${camera.name}`}>×</button>
+        {canManage && <button className="remove-camera" onClick={onRemove} title="Remove camera" aria-label={`Remove ${camera.name}`}>×</button>}
       </div>
     </article>
   );
@@ -178,6 +267,8 @@ export default function App() {
   const [clock, setClock] = useState(new Date());
   const [cameraSearch, setCameraSearch] = useState("");
   const [cameraFilter, setCameraFilter] = useState("all");
+  const [cameraSourceFilter, setCameraSourceFilter] = useState("all");
+  const [cameraLocationFilter, setCameraLocationFilter] = useState("all");
   const [gridColumns, setGridColumns] = useState("auto");
   const [cameraDialog, setCameraDialog] = useState(false);
   const [rtspDialog, setRtspDialog] = useState(false);
@@ -551,6 +642,21 @@ export default function App() {
     }
   }
 
+  async function toggleCameraAI(camera: Camera) {
+    try {
+      const response = await api<{ ai_enabled: boolean }>(`/cameras/${camera.id}/ai`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !camera.ai_enabled }),
+      });
+      setCameras((current) => current.map((item) =>
+        item.id === camera.id ? { ...item, ai_enabled: response.ai_enabled } : item
+      ));
+      pushToast(`${camera.name}: AI ${response.ai_enabled ? "enabled" : "disabled"}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "AI setting failed");
+    }
+  }
+
   async function batchControlCameras(action: "start" | "stop") {
     const targets = cameras.filter((cam) =>
       action === "start" ? cam.status === "stopped" : cam.status === "running",
@@ -643,6 +749,7 @@ export default function App() {
   ).length;
   const ready = recordings.filter((item) => item.status === "ready").length;
   const runningCamerasCount = cameras.filter((camera) => camera.status === "running").length;
+  const cameraLocations = Array.from(new Set(cameras.map((camera) => camera.location).filter(Boolean))).sort();
   const totalBytes = recordings.reduce((total, item) => total + item.bytes, 0);
   const filteredUsers = userAccounts.filter((user) =>
     `${user.full_name} ${user.username} ${user.email}`.toLowerCase().includes(userSearch.toLowerCase()),
@@ -666,7 +773,9 @@ export default function App() {
   }[activePage];
   const visibleCameras = cameras.filter((camera) =>
     `${camera.name} ${camera.location} ${camera.id}`.toLowerCase().includes(cameraSearch.toLowerCase()) &&
-    (cameraFilter === "all" || camera.status === cameraFilter),
+    (cameraFilter === "all" || camera.status === cameraFilter) &&
+    (cameraSourceFilter === "all" || camera.source_type === cameraSourceFilter) &&
+    (cameraLocationFilter === "all" || camera.location === cameraLocationFilter),
   );
   const navigation = [
     { id: "dashboard" as const, label: "Overview", permission: "camera.read" },
@@ -785,14 +894,14 @@ export default function App() {
             <div className="hero-boost-copy">
               <div className="hero-boost-status">
                 <i aria-hidden="true" />
-                ALL SYSTEMS NOMINAL · WORKSPACE READY
+                PRIVATE WORKSPACE · STATUS BELOW
               </div>
               <h2>
                 {greetingFor(clock)}, {session.full_name}
               </h2>
               <p>
                 {runningCamerasCount > 0
-                  ? `${runningCamerasCount} live camera feed${runningCamerasCount > 1 ? "s" : ""} active and ${ready} recording${ready === 1 ? "" : "s"} ready for review.`
+                  ? `${runningCamerasCount} camera feed${runningCamerasCount > 1 ? "s" : ""} requested to run and ${ready} recording${ready === 1 ? "" : "s"} ready for review.`
                   : ready > 0
                     ? `${ready} processed recording${ready === 1 ? "" : "s"} ready in your library. Launch a virtual camera feed anytime.`
                     : "Your intelligent surveillance center is online. Upload a video to start streaming and analyzing."}
@@ -834,10 +943,16 @@ export default function App() {
               <div><span>TOTAL CAMERAS</span><strong>{cameras.length.toString().padStart(2, "0")}</strong><small>Registered feeds</small></div>
               <div><span>STARTED FEEDS</span><strong>{cameras.filter((camera) => camera.status === "running").length.toString().padStart(2, "0")}</strong><small>Requested playback</small></div>
               <div><span>STOPPED</span><strong>{cameras.filter((camera) => camera.status === "stopped").length.toString().padStart(2, "0")}</strong><small>Ready to start</small></div>
-              <div><span>RTSP CAMERAS</span><strong>{cameras.filter((camera) => camera.source_type === "rtsp").length.toString().padStart(2, "0")}</strong><small>Configured sources</small></div>
+          <div><span>RTSP ONLINE</span><strong>{cameras.filter((camera) => camera.source_type === "rtsp" && camera.connection_status === "online").length.toString().padStart(2, "0")}</strong><small>Fresh camera frames</small></div>
             </section>
             <div className="camera-toolbar">
               <input type="search" placeholder="Search camera or location…" aria-label="Search cameras" value={cameraSearch} onChange={(event) => setCameraSearch(event.target.value)} />
+              <select className="camera-filter-select" aria-label="Filter by camera source" value={cameraSourceFilter} onChange={(event) => setCameraSourceFilter(event.target.value)}>
+                <option value="all">All sources</option><option value="virtual">Virtual video</option><option value="rtsp">RTSP camera</option>
+              </select>
+              <select className="camera-filter-select" aria-label="Filter by location" value={cameraLocationFilter} onChange={(event) => setCameraLocationFilter(event.target.value)}>
+                <option value="all">All locations</option>{cameraLocations.map((location) => <option key={location} value={location}>{location}</option>)}
+              </select>
               <div className="camera-toolbar-actions">
                 <div className="pill-group" role="group" aria-label="Filter cameras by status">
                   {(["all", "running", "stopped"] as const).map((status) => (
@@ -847,7 +962,7 @@ export default function App() {
                       className={`pill-btn ${cameraFilter === status ? "active" : ""}`}
                       onClick={() => setCameraFilter(status)}
                     >
-                      {status === "all" ? `All (${cameras.length})` : status === "running" ? `Live (${runningCamerasCount})` : `Stopped (${cameras.length - runningCamerasCount})`}
+                      {status === "all" ? `All (${cameras.length})` : status === "running" ? `Started (${runningCamerasCount})` : `Stopped (${cameras.length - runningCamerasCount})`}
                     </button>
                   ))}
                 </div>
@@ -871,14 +986,14 @@ export default function App() {
                 )}
               </div>
             </div>
-            <section className={`camera-wall grid-${gridColumns}`} aria-label="Virtual camera feeds">
+            <section className={`camera-wall grid-${gridColumns}`} aria-label="Camera feeds">
               {visibleCameras.map((camera, index) => (
-                <CameraFeed key={camera.id + (camera.playback_revision ?? "")} camera={camera} index={index} onControl={(action) => void controlCamera(camera.id, action)} onSnapshot={pushToast} onRemove={() => { if (window.confirm(`Remove ${camera.name} from the dashboard?`)) void removeCamera(camera.id); }} />
+                <CameraFeed key={camera.id + (camera.playback_revision ?? "")} camera={camera} index={index} canManage={session.permissions.includes("camera.manage")} sampleIntervalMs={session.ai_sample_interval_ms} onControl={(action) => void controlCamera(camera.id, action)} onToggleAI={() => void toggleCameraAI(camera)} onSnapshot={pushToast} onRemove={() => { if (window.confirm(`Remove ${camera.name} from the dashboard?`)) void removeCamera(camera.id); }} />
               ))}
               {!cameras.length && <div className="camera-empty"><span>◉</span><h2>No cameras on the dashboard</h2><p>Add an RTSP camera or use an uploaded video as a virtual camera.</p>{session.permissions.includes("camera.manage") && <button className="primary" onClick={() => setAddCameraDialog(true)}>＋ Add your first camera</button>}</div>}
-              {!!cameras.length && !visibleCameras.length && <div className="camera-empty"><h2>No matching cameras</h2><p>Try another name, location or status.</p><button className="secondary" onClick={() => { setCameraSearch(""); setCameraFilter("all"); }}>Clear filters</button></div>}
+              {!!cameras.length && !visibleCameras.length && <div className="camera-empty"><h2>No matching cameras</h2><p>Try another name, location, source or status.</p><button className="secondary" onClick={() => { setCameraSearch(""); setCameraFilter("all"); setCameraSourceFilter("all"); setCameraLocationFilter("all"); }}>Clear filters</button></div>}
             </section>
-            <p className="camera-note">Virtual cameras use uploaded footage. RTSP feeds connect when started and viewed; camera hardware requires separate verification.</p>
+            <p className="camera-note">Virtual cameras use uploaded footage. Started RTSP cameras connect through the backend; camera hardware requires separate verification.</p>
           </>
         )}
         {activePage === "recordings" && (

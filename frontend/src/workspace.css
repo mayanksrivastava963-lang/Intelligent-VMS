@@ -1034,6 +1034,16 @@ header strong {
   gap: 12px;
 }
 
+.camera-filter-select {
+  min-height: 38px;
+  padding: 7px 30px 7px 11px;
+  border: 1px solid #cbd5e1;
+  border-radius: 9px;
+  background: #fff;
+  color: #334155;
+  font: inherit;
+}
+
 .camera-card {
   border-radius: 15px;
   border: 1px solid #e2e8f0;
@@ -1090,6 +1100,54 @@ header strong {
   background: rgba(255, 255, 255, 0.92);
   border-color: #cbd5e1;
   color: #475569;
+}
+
+.camera-live.connecting i, .camera-live.reconnecting i, .camera-live.loading i {
+  background: #fbbf24;
+}
+
+.camera-live.offline i, .camera-live.error i {
+  background: #fb7185;
+}
+
+.camera-live.paused i {
+  background: #94a3b8;
+}
+
+.detection-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.detection-overlay rect {
+  fill: none;
+  stroke: #6ee7b7;
+  stroke-width: 2;
+}
+
+.detection-overlay text {
+  fill: #eafff6;
+  stroke: #052e2b;
+  stroke-width: 3px;
+  paint-order: stroke;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.ai-indicator {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: rgba(3, 34, 37, 0.85);
+  color: #99f6e4;
+  font-size: 11px;
+  font-weight: 700;
+  pointer-events: none;
 }
 
 .snapshot-button {

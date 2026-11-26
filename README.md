@@ -30,17 +30,21 @@ fullscreen and remove controls. The upload picker accepts multiple files and
 uploads them one at a time. See the camera API and limitations in the
 [recording workspace guide](docs/recording-workspace.md#virtual-camera-dashboard).
 
-## AI engine
-
-### RTSP camera preview
+## RTSP camera preview
 
 In **Live view**, choose **Add RTSP camera**, enter a name, location and the
-authorized `rtsp://` URL, then start the feed. The backend decodes RTSP over TCP
-and sends a browser-compatible MJPEG preview. Each viewer creates a separate
-camera connection and decoder; CPU and bandwidth grow with viewers.
-The preview samples up to 10 frames per second and does not record the stream.
-The UI reports connecting until frames arrive; a started camera is a requested
-state, not a guarantee that the camera is online. It retries failed connections.
+authorized `rtsp://` URL, then start the feed. One backend process opens one
+RTSP decoder per camera and shares its latest JPEG frame with authorized
+dashboard viewers. The preview samples up to 10 frames per second and does not
+record the stream. The backend reports connecting, online, reconnecting, or
+offline from decoder activity and frame freshness. A started camera is only a
+requested state. Connections retry after failures. Stopping or removing a
+camera closes its shared acquisition independently of other cameras.
+
+Run the API with one Uvicorn worker for this local in-memory stream hub. A
+multi-process deployment needs an external shared streaming service such as
+MediaMTX and separate access controls. The current MJPEG preview is intended
+for local development and is not a production streaming architecture.
 
 RTSP addresses are encrypted in the database using a key derived from
 `VMS_SESSION_SECRET`; keep that secret stable and backed up. Changing it makes
@@ -48,8 +52,23 @@ previously saved camera addresses unreadable and requires re-adding them. URLs
 are excluded from camera API responses. Physical CCTV and RTSP transport testing
 remain pending until a camera or simulated RTSP server is available.
 
-Local detection and tracking are separate from recording. See the
-[AI engine documentation](services/ai_engine/README.md).
+## AI engine
+
+Each camera card has **Enable AI** / **Disable AI**. The switch is stored in
+the database. While an enabled camera is playing, the browser sends a reduced
+JPEG frame to the authenticated API every two seconds by default. One shared
+SSDLite detector processes a bounded sample at a time; fresh detections are
+drawn briefly over the matching video frame with class, confidence and object
+count. Set `AI_SAMPLE_INTERVAL_MS` in `.env` to change the sampling interval
+(minimum 1000 ms). Paused feeds do not send samples. An AI failure is shown on
+the tile and does not stop video playback.
+
+This initial dashboard inference requires the Python environment to contain
+the dependencies in `services/ai_engine/requirements.txt` and cached model
+weights. The lightweight backend Docker image currently lacks PyTorch and
+OpenCV, so its AI endpoint returns unavailable. Dashboard AI sampling only
+runs while that dashboard is open; background AI analytics and recording are
+separate milestones. See the [AI engine documentation](services/ai_engine/README.md).
 
 ## Validation
 

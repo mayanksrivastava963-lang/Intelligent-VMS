@@ -81,7 +81,7 @@ export default function LoginPage({
           </h1>
           <p>
             Monitor your virtual cameras, inspect segmented recordings, and
-            track host resources in real time from one encrypted command center.
+            track host resources in real time from one private workspace.
           </p>
 
           <div className="login-stage-wrap" aria-hidden="true">
@@ -128,7 +128,7 @@ export default function LoginPage({
               </div>
 
               <div className="stage-footer">
-                <span>◉ Camera overview · Encrypted feed</span>
+                <span>◉ Camera overview · Authorized preview</span>
                 <span className="stage-bars">
                   <i />
                   <i />

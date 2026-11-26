@@ -1,5 +1,6 @@
 import subprocess
 import time
+from io import BytesIO
 from fractions import Fraction
 from pathlib import Path
 from threading import Event
@@ -83,9 +84,10 @@ def test_viewer_cannot_add_rtsp_camera(client):
     assert response.status_code == 403
 
 
-def test_rtsp_stream_emits_jpeg_from_decoded_frame(client, monkeypatch):
-    from backend.app.services.rtsp import mjpeg_stream
+def test_rtsp_stream_shares_one_decoder_between_viewers(client, monkeypatch):
     from PIL import Image
+
+    opened = []
 
     class Frame:
         def to_image(self):
@@ -94,18 +96,59 @@ def test_rtsp_stream_emits_jpeg_from_decoded_frame(client, monkeypatch):
     class Container:
         def __enter__(self): return self
         def __exit__(self, *_args): return False
-        def decode(self, video): return iter([Frame()])
+        def decode(self, video):
+            while True:
+                time.sleep(0.02)
+                yield Frame()
 
-    monkeypatch.setattr("backend.app.services.rtsp.av.open", lambda *_args, **_kwargs: Container())
+    def open_source(*_args, **_kwargs):
+        opened.append(True)
+        return Container()
+
+    monkeypatch.setattr("backend.app.services.rtsp.av.open", open_source)
     sign_in(client)
     headers = {"X-VMS-Request": "1"}
     camera = client.post("/api/cameras/rtsp", headers=headers, json={"name": "Test", "url": "rtsp://127.0.0.1/live"}).json()
     client.post(f"/api/cameras/{camera['id']}/start", headers=headers)
-    stream = mjpeg_stream(client.app.state.engine, camera["id"], client.app.state.settings["session_secret"])
-    frame = next(stream)
-    assert frame.startswith(b"--frame\r\nContent-Type: image/jpeg")
-    assert b"\xff\xd8\xff" in frame
-    stream.close()
+    hub = client.app.state.stream_hub
+    first = hub.frames(camera["id"], lambda: True)
+    second = hub.frames(camera["id"], lambda: True)
+    first_frame = next(first)
+    second_frame = next(second)
+    assert first_frame.startswith(b"--frame\r\nContent-Type: image/jpeg")
+    assert b"\xff\xd8\xff" in first_frame
+    assert second_frame == first_frame
+    assert len(opened) == 1
+    listed = client.get("/api/cameras").json()
+    assert next(item for item in listed if item["id"] == camera["id"])["connection_status"] == "online"
+    client.post(f"/api/cameras/{camera['id']}/stop", headers=headers)
+    first.close()
+    second.close()
+
+
+def test_rtsp_connection_failure_is_reported_without_exposing_url(client, monkeypatch):
+    def fail_to_connect(*_args, **_kwargs):
+        raise OSError("rtsp://operator:private@127.0.0.1/live")
+
+    monkeypatch.setattr("backend.app.services.rtsp.av.open", fail_to_connect)
+    sign_in(client)
+    headers = {"X-VMS-Request": "1"}
+    camera = client.post("/api/cameras/rtsp", headers=headers, json={
+        "name": "Offline camera", "url": "rtsp://operator:private@127.0.0.1/live",
+    }).json()
+    camera_id = camera["id"]
+    client.post(f"/api/cameras/{camera_id}/start", headers=headers)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        listed = client.get("/api/cameras").json()
+        state = next(item for item in listed if item["id"] == camera_id)["connection_status"]
+        if state == "offline":
+            break
+        time.sleep(0.02)
+    assert state == "offline"
+    assert "private" not in client.get("/api/cameras").text
+    assert client.get("/api/health").status_code == 200
+    client.post(f"/api/cameras/{camera_id}/stop", headers=headers)
 
 
 def test_backend_exposes_swagger_and_does_not_serve_frontend(client):
@@ -341,6 +384,57 @@ def test_complete_upload_segmentation_playback(client, settings, tmp_path):
     assert client.get(url, headers={"Range": "bytes=0-9,20-29"}).status_code == 416
 
 
+def test_two_uploaded_videos_become_independent_virtual_cameras(client, settings, tmp_path):
+    sign_in(client)
+    ids = []
+    for name in ("entrance", "loading-bay"):
+        if name == "entrance":
+            source = generate_video(tmp_path / "entrance.mp4", duration=1.2, audio=False)
+            filename = "entrance.mp4"
+        else:
+            path = tmp_path / "loading-bay.avi"
+            subprocess.run([
+                imageio_ffmpeg.get_ffmpeg_exe(), "-v", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc2=size=160x90:rate=10", "-t", "1.2", "-c:v", "mpeg4",
+                "-q:v", "5", str(path),
+            ], check=True, timeout=60, capture_output=True)
+            source = path.read_bytes()
+            filename = path.name
+        response = upload(client, source, filename)
+        assert response.status_code == 202
+        ids.append(response.json()["id"])
+
+    engine = client.app.state.engine
+    for _ in ids:
+        assert process_job(engine, claim_job(engine), settings)
+
+    camera_ids = []
+    for video_id, name in zip(ids, ("Entrance", "Loading bay")):
+        response = client.post("/api/cameras", headers={"X-VMS-Request": "1"}, json={
+            "video_id": video_id, "name": name,
+        })
+        assert response.status_code == 201
+        camera_ids.append(response.json()["id"])
+        assert client.post(f"/api/cameras/{camera_ids[-1]}/start",
+                           headers={"X-VMS-Request": "1"}).status_code == 200
+
+    listed = client.get("/api/cameras").json()
+    assert {camera["id"] for camera in listed} == set(camera_ids)
+    assert {camera["video_id"] for camera in listed} == set(ids)
+    assert all(camera["status"] == "running" for camera in listed)
+    for camera in listed:
+        playback = client.get(camera["segments"][0]["playback_url"], headers={"Range": "bytes=0-99"})
+        assert playback.status_code == 206
+        assert playback.content.startswith(b"\x00\x00")
+
+    assert client.post(f"/api/cameras/{camera_ids[0]}/stop",
+                       headers={"X-VMS-Request": "1"}).status_code == 200
+    listed = client.get("/api/cameras").json()
+    assert {camera["id"]: camera["status"] for camera in listed} == {
+        camera_ids[0]: "stopped", camera_ids[1]: "running",
+    }
+
+
 def test_actual_thirty_minute_boundaries(client, settings, tmp_path):
     settings["segment_seconds"] = 1800
     sign_in(client)
@@ -459,6 +553,58 @@ def test_virtual_camera_lifecycle_preserves_source_recording(client):
     assert get_video(engine, "ready-video")["status"] == "ready"
     with engine.connect() as connection:
         assert connection.execute(select(cameras)).first() is None
+
+
+def test_camera_ai_switch_and_failure_do_not_stop_video(client, monkeypatch):
+    from PIL import Image
+
+    sign_in(client)
+    engine = client.app.state.engine
+    now = time.time()
+    with engine.begin() as connection:
+        connection.execute(videos.insert().values(
+            id="ai-ready-video", filename="sample.mp4", status="ready", bytes=100,
+            created_at=now, updated_at=now, duration_seconds=3, segment_seconds=2,
+            progress=100, attempts=1,
+        ))
+    headers = {"X-VMS-Request": "1"}
+    camera = client.post("/api/cameras", headers=headers, json={
+        "video_id": "ai-ready-video", "name": "AI camera",
+    }).json()
+    camera_id = camera["id"]
+    assert camera["ai_enabled"] is False
+    image = Image.new("RGB", (32, 24), "blue")
+    output = BytesIO()
+    image.save(output, format="JPEG")
+    endpoint = f"/api/cameras/{camera_id}/ai/detections"
+    assert client.post(endpoint, content=output.getvalue(), headers=headers).status_code == 409
+    assert client.put(f"/api/cameras/{camera_id}/ai", json={"enabled": True}, headers=headers).status_code == 200
+    assert client.post(f"/api/cameras/{camera_id}/start", headers=headers).json()["ai_enabled"] is True
+    assert client.get("/api/cameras").json()[0]["ai_enabled"] is True
+    assert client.post(endpoint, content=b"invalid-jpeg", headers=headers).status_code == 400
+    client.app.state.ai_sample_times.clear()
+    assert client.post(endpoint, content=b"x" * 600_001, headers=headers).status_code == 413
+
+    def sample_detection(data):
+        assert data == output.getvalue()
+        return {"width": 32, "height": 24, "detections": [{
+            "class_id": 1, "class_name": "person", "confidence": 0.8,
+            "bbox": [1, 2, 20, 22],
+        }]}
+
+    monkeypatch.setattr("backend.app.main.detect_jpeg", sample_detection)
+    result = client.post(endpoint, content=output.getvalue(), headers=headers)
+    assert result.status_code == 200
+    assert result.json()["detections"][0]["class_name"] == "person"
+    assert client.post(endpoint, content=output.getvalue(), headers=headers).status_code == 429
+
+    client.app.state.ai_sample_times.clear()
+    monkeypatch.setattr("backend.app.main.detect_jpeg", lambda _data: (_ for _ in ()).throw(RuntimeError("GPU failed")))
+    assert client.post(endpoint, content=output.getvalue(), headers=headers).status_code == 503
+    assert client.get("/api/cameras").json()[0]["status"] == "running"
+    assert client.put(f"/api/cameras/{camera_id}/ai", json={"enabled": False}, headers=headers).status_code == 200
+    assert client.get("/api/cameras").json()[0]["ai_enabled"] is False
+    assert client.post(endpoint, content=output.getvalue(), headers=headers).status_code == 409
 
 
 def test_virtual_camera_requires_a_ready_recording(client):

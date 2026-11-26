@@ -1,9 +1,10 @@
-"""RTSP camera configuration and browser-compatible MJPEG streaming."""
+"""RTSP camera configuration and shared browser-compatible preview frames."""
 
 import base64
 import hashlib
 import io
 import time
+from threading import Condition, Event, Lock, Thread
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -35,10 +36,13 @@ def list_rtsp_cameras(engine):
     return [public_camera(row) for row in rows]
 
 
-def public_camera(row):
+def public_camera(row, connection_status=None):
+    if connection_status is None:
+        connection_status = "stopped" if row["status"] == "stopped" else "connecting"
     return {"id": row["id"], "video_id": None, "name": row["name"],
             "location": row["location"], "source_type": "rtsp", "status": row["status"],
-            "filename": "RTSP camera", "duration_seconds": None, "segments": []}
+            "connection_status": connection_status, "filename": "RTSP camera",
+            "duration_seconds": None, "segments": []}
 
 
 def create_rtsp_camera(engine, secret, name, location, url):
@@ -64,37 +68,139 @@ def update_rtsp_camera(engine, camera_id, status=None):
         return result.rowcount == 1
 
 
-def mjpeg_stream(engine, camera_id, secret, session_valid=None):
-    while True:
-        if session_valid and not session_valid():
-            return
-        row = get_rtsp_camera(engine, camera_id)
-        if not row or row["status"] != "running":
-            return
-        try:
-            source = cipher(secret).decrypt(row["source_encrypted"].encode()).decode()
-            with av.open(source, options={"rtsp_transport": "tcp"}, timeout=(5, 5)) as container:
-                last_frame = 0.0
-                last_check = 0.0
-                for frame in container.decode(video=0):
-                    now = time.monotonic()
-                    if now - last_check >= 2:
-                        if session_valid and not session_valid():
+class CameraStream:
+    """One decoder and one latest-frame buffer for all viewers of a camera."""
+
+    def __init__(self, engine, camera_id, secret, reconnect_seconds=3):
+        self.engine = engine
+        self.camera_id = camera_id
+        self.secret = secret
+        self.reconnect_seconds = reconnect_seconds
+        self.stopped = Event()
+        self.changed = Condition()
+        self.frame = None
+        self.frame_number = 0
+        self.frame_time = 0.0
+        self.state = "connecting"
+        self.thread = Thread(target=self.run, name=f"rtsp-{camera_id[:8]}", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stopped.set()
+        with self.changed:
+            self.state = "stopped"
+            self.changed.notify_all()
+        self.thread.join(timeout=6)
+
+    def status(self):
+        with self.changed:
+            if self.state == "online" and time.monotonic() - self.frame_time > 3:
+                return "reconnecting"
+            return self.state
+
+    def latest(self, previous_number, timeout=1):
+        with self.changed:
+            self.changed.wait_for(
+                lambda: self.frame_number != previous_number or self.stopped.is_set(), timeout=timeout
+            )
+            return self.frame_number, self.frame, self.stopped.is_set()
+
+    def run(self):
+        attempts = 0
+        while not self.stopped.is_set():
+            try:
+                row = get_rtsp_camera(self.engine, self.camera_id)
+                if not row or row["status"] != "running":
+                    return
+                source = cipher(self.secret).decrypt(row["source_encrypted"].encode()).decode()
+                with av.open(source, options={"rtsp_transport": "tcp"}, timeout=(5, 5)) as container:
+                    last_frame = 0.0
+                    for frame in container.decode(video=0):
+                        if self.stopped.is_set():
                             return
-                        row = get_rtsp_camera(engine, camera_id)
-                        if not row or row["status"] != "running":
-                            return
-                        last_check = now
-                    if now - last_frame < 0.1:
-                        continue
-                    output = io.BytesIO()
-                    image = frame.to_image()
-                    image.thumbnail((1280, 720))
-                    image.save(output, format="JPEG", quality=75)
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + output.getvalue() + b"\r\n"
-                    last_frame = now
-        except Exception:
-            # Camera URLs and passwords must never appear in logs or API errors.
-            pass
-        # A stream can close cleanly as well as fail; avoid a tight reconnect loop.
-        time.sleep(3)
+                        now = time.monotonic()
+                        if now - last_frame < 0.1:
+                            continue
+                        output = io.BytesIO()
+                        image = frame.to_image()
+                        image.thumbnail((1280, 720))
+                        image.save(output, format="JPEG", quality=75)
+                        with self.changed:
+                            self.frame = output.getvalue()
+                            self.frame_number += 1
+                            self.frame_time = now
+                            self.state = "online"
+                            self.changed.notify_all()
+                        attempts = 0
+                        last_frame = now
+            except Exception:
+                # Decoder exceptions can include credential-bearing URLs.
+                pass
+            attempts += 1
+            with self.changed:
+                self.frame = None
+                self.state = "reconnecting" if self.frame_number else "offline"
+                self.changed.notify_all()
+            if self.stopped.wait(min(self.reconnect_seconds * attempts, 15)):
+                return
+
+
+class StreamHub:
+    def __init__(self, engine, secret):
+        self.engine = engine
+        self.secret = secret
+        self.lock = Lock()
+        self.streams = {}
+
+    def start(self, camera_id):
+        with self.lock:
+            stream = self.streams.get(camera_id)
+            if stream and stream.thread.is_alive():
+                return
+            stream = CameraStream(self.engine, camera_id, self.secret)
+            self.streams[camera_id] = stream
+            stream.start()
+
+    def stop(self, camera_id):
+        with self.lock:
+            stream = self.streams.pop(camera_id, None)
+        if stream:
+            stream.stop()
+
+    def restart(self, camera_id):
+        self.stop(camera_id)
+        self.start(camera_id)
+
+    def status(self, camera_id):
+        with self.lock:
+            stream = self.streams.get(camera_id)
+        return stream.status() if stream else "connecting"
+
+    def frames(self, camera_id, session_valid):
+        with self.lock:
+            stream = self.streams.get(camera_id)
+        if stream is None:
+            return
+        previous_number = 0
+        last_auth_check = 0.0
+        while not stream.stopped.is_set():
+            now = time.monotonic()
+            if now - last_auth_check >= 2:
+                if not session_valid():
+                    return
+                last_auth_check = now
+            number, frame, stopped = stream.latest(previous_number)
+            if stopped:
+                return
+            if number != previous_number:
+                previous_number = number
+                if frame is not None and stream.status() == "online":
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+
+    def close(self):
+        with self.lock:
+            camera_ids = list(self.streams)
+        for camera_id in camera_ids:
+            self.stop(camera_id)

@@ -53,3 +53,9 @@ rtsp_cameras = Table(
     Column("status", String(20), nullable=False, default="stopped"),
     Column("created_at", Float, nullable=False),
 )
+
+camera_ai = Table(
+    "camera_ai", metadata,
+    Column("camera_id", String(36), primary_key=True),
+    Column("enabled", Integer, nullable=False, default=0),
+)
