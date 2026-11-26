@@ -1,0 +1,14 @@
+fastapi==0.165.0
+uvicorn==0.54.0
+starlette==1.10.0
+SQLAlchemy==2.1.9
+psycopg[binary]==3.3.9
+av==19.0.2
+imageio-ffmpeg==0.8.1
+itsdangerous==2.2.0
+argon2-cffi==25.1.0
+python-dotenv==1.2.4
+anyio==4.16.0
+psutil==7.2.2
+cryptography>=44,<47
+pillow>=10,<13

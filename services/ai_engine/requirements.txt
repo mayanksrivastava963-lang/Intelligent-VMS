@@ -1,0 +1,26 @@
+# Install CUDA PyTorch first; see docs/deep-learning-setup.md.
+torch==2.11.0
+torchvision==0.26.0
+ultralytics
+numpy
+opencv-python
+pillow
+scipy
+pandas
+scikit-learn
+matplotlib
+seaborn
+jupyterlab
+ipykernel
+ipywidgets
+tensorboard
+onnx
+onnxruntime
+timm
+transformers
+accelerate
+safetensors
+python-dotenv
+fastapi
+uvicorn
+pytest

@@ -23,6 +23,7 @@ storage/
 *.mkv
 *.avi
 *.ts
+!frontend/**/*.ts
 
 # AI model weights
 *.pt

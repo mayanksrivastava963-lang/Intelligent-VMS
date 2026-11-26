@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+**/.venv
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+storage
+logs
+frontend/dist
+services/ai_engine
+*.mp4
+*.avi
+*.mkv

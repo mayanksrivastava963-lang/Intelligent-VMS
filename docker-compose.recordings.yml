@@ -1,0 +1,72 @@
+name: intelligent-vms
+
+x-recording-environment: &recording-environment
+  RECORDING_DATABASE: postgres
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB}
+  VMS_OPERATOR_PASSWORD: ${VMS_OPERATOR_PASSWORD:?Set a 12+ character operator password}
+  VMS_SESSION_SECRET: ${VMS_SESSION_SECRET:?Set a random 32+ character session secret}
+  VMS_SECURE_COOKIE: ${VMS_SECURE_COOKIE:-false}
+  RECORDING_STORAGE_PATH: /app/storage/recordings
+  RECORDING_SEGMENT_SECONDS: 1800
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-21474836480}
+  MIN_FREE_BYTES: ${MIN_FREE_BYTES:-1073741824}
+  FFMPEG_THREADS: ${FFMPEG_THREADS:-2}
+
+services:
+  recording-init:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: intelligent-vms-recordings:local
+    environment: *recording-environment
+    volumes:
+      - recording_data:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-c", "from backend.app.core.config import load_settings; from backend.app.database.session import create_database; create_database(load_settings()['database_url']).dispose()"]
+
+  recording-api:
+    image: intelligent-vms-recordings:local
+    environment: *recording-environment
+    restart: unless-stopped
+    mem_limit: 1g
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - recording_data:/app/storage
+    depends_on:
+      recording-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+
+  recording-worker:
+    image: intelligent-vms-recordings:local
+    environment: *recording-environment
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    command: ["python", "-m", "services.recording_engine.worker"]
+    volumes:
+      - recording_data:/app/storage
+    depends_on:
+      recording-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+
+volumes:
+  recording_data:

@@ -1,0 +1,17 @@
+{
+  "input": "synthetic seeded noise, 1280x720 BGR; no accuracy evaluation",
+  "device": "cuda",
+  "model_parameter_device": "cuda:0",
+  "torch": "2.11.0+cu128",
+  "cuda_runtime": "12.8",
+  "iterations": 50,
+  "warmup": 10,
+  "mean_detection_ms": 79.96229600074003,
+  "p50_detection_ms": 79.60925000224961,
+  "p95_detection_ms": 88.03137500071898,
+  "serial_detection_fps": 12.50589402773959,
+  "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+  "mean_cuda_event_span_ms": 79.9111296081543,
+  "peak_allocated_mib": 48.5595703125,
+  "peak_reserved_mib": 80.0
+}
