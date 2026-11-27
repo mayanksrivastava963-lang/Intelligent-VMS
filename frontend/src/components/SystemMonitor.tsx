@@ -3,6 +3,7 @@ import type { CSSProperties } from "react";
 import { api } from "../api";
 
 type Metrics = {
+  resource_policy?: { level: string; thresholds: number[]; unknown: string[]; host_telemetry_stale: boolean };
   sampled_at: number;
   cpu: { percent: number; logical_cores: number | null; physical_cores: number | null };
   memory: { percent: number; used_bytes: number; available_bytes: number; total_bytes: number };
@@ -168,6 +169,16 @@ export default function SystemMonitor({ compact = false }: { compact?: boolean }
         </div>
       )}
 
+      {metrics?.resource_policy && metrics.resource_policy.level !== "normal" && (
+        <div className="error" role="alert">
+          Resource pressure: {metrics.resource_policy.level}. Existing recordings have priority.
+          {metrics.resource_policy.level === "reduce" && " Optional AI processing is paused."}
+          {metrics.resource_policy.level === "block" && " New workloads are temporarily paused."}
+          {metrics.resource_policy.host_telemetry_stale && " Host resource monitoring is unavailable."}
+        </div>
+      )}
+      {!!metrics?.resource_policy?.unknown.length && <p>Unavailable resource readings: {metrics.resource_policy.unknown.join(", ")}.</p>}
+
       {!metrics && !error && (
         <div className="metrics-loading">
           <div className="skeleton-cards" aria-hidden="true">
@@ -193,8 +204,8 @@ export default function SystemMonitor({ compact = false }: { compact?: boolean }
             <div className="resource-value">
               {card.value.toFixed(1)}
               <span>%</span>
-              <small className={card.value >= 85 ? "usage-high" : ""}>
-                {card.value >= 85 ? "High usage" : "Nominal"}
+              <small className={card.value >= (metrics?.resource_policy?.thresholds[0] ?? 75) ? "usage-high" : ""}>
+                {card.value >= (metrics?.resource_policy?.thresholds[0] ?? 75) ? "High usage" : "Nominal"}
               </small>
             </div>
             <div

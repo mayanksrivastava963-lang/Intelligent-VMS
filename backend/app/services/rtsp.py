@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import io
+import ipaddress
 import json
 import time
 from threading import Condition, Event, Lock, Thread
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 import av
 from cryptography.fernet import Fernet
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, update, func, text
 
 from backend.app.models.recordings import rtsp_cameras
 
@@ -33,6 +34,24 @@ def valid_rtsp_url(url):
         return False
 
 
+def allowed_camera_url(url, networks):
+    """Use literal addresses to avoid DNS rebinding between validation and pull.
+
+    Hostname support requires pinned resolution in every acquisition transport.
+    Never echo rejected sources: they may contain camera credentials.
+    """
+    if not valid_rtsp_url(url):
+        return False
+    try:
+        address = ipaddress.ip_address(urlsplit(url).hostname)
+        if (address.is_loopback or address.is_link_local or address.is_multicast
+                or address.is_unspecified or getattr(address, "ipv4_mapped", None)):
+            return False
+        return any(address in ipaddress.ip_network(network) for network in networks)
+    except ValueError:
+        return False
+
+
 def list_rtsp_cameras(engine, limit=None, offset=0):
     with engine.connect() as connection:
         query = select(rtsp_cameras).order_by(rtsp_cameras.c.created_at)
@@ -45,7 +64,14 @@ def list_rtsp_cameras(engine, limit=None, offset=0):
 def public_camera(row, connection_status=None):
     if connection_status is None:
         connection_status = "stopped" if row["status"] == "stopped" else "connecting"
+    recorded_at = row["last_frame_at"]
+    recording_status = row["health_status"]
+    if row["status"] == "stopped":
+        recording_status = "stopped"
+    elif recording_status == "online" and (not recorded_at or time.time() - recorded_at > 30):
+        recording_status = "stale"
     return {"id": row["id"], "video_id": None, "name": row["name"],
+            "recording_status": recording_status, "last_recording_frame_at": recorded_at,
             "location": row["location"], "source_type": "rtsp", "status": row["status"],
             "connection_status": connection_status, "filename": "RTSP camera",
             "duration_seconds": None, "segments": [],
@@ -76,6 +102,21 @@ def update_rtsp_camera(engine, camera_id, status=None):
         else:
             result = connection.execute(update(rtsp_cameras).where(rtsp_cameras.c.id == camera_id).values(status=status))
         return result.rowcount == 1
+
+
+def admit_rtsp_camera(engine, camera_id, limit):
+    """Serialize admission across API replicas sharing the production database."""
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(text("SELECT pg_advisory_xact_lock(1867087103)"))
+        status = connection.execute(select(rtsp_cameras.c.status).where(rtsp_cameras.c.id == camera_id)).scalar_one_or_none()
+        if status == "running":
+            return True
+        count = connection.execute(select(func.count()).select_from(rtsp_cameras).where(rtsp_cameras.c.status == "running")).scalar_one()
+        if status is None or count >= limit:
+            return False
+        connection.execute(update(rtsp_cameras).where(rtsp_cameras.c.id == camera_id).values(status="running"))
+        return True
 
 
 class CameraStream:

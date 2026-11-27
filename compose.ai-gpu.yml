@@ -1,0 +1,21 @@
+# GPU overlay for AI worker — use with: docker compose -f compose.production.yml -f compose.ai-gpu.yml --profile ai up -d --build
+name: ${COMPOSE_PROJECT_NAME:-intelligent-vms}
+
+services:
+  ai-worker:
+    build:
+      context: .
+      dockerfile: services/ai_engine/Dockerfile
+      args:
+        PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu128
+    image: intelligent-vms-ai:0.1.0-gpu
+    environment:
+      AI_DEVICE: ${VMS_AI_DEVICE:-cuda}
+      AI_GPU_MEMORY_FRACTION: ${VMS_AI_GPU_MEMORY_FRACTION:-0.5}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

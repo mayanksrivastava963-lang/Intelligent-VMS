@@ -23,7 +23,7 @@ from services.recording_engine.probe import inspect_video
 def settings(tmp_path):
     storage = tmp_path / "recordings"
     storage.mkdir()
-    return {"storage": storage, "database_url": "sqlite:///" + (tmp_path / "test.db").as_posix(),
+    return {"internal_test_tools": True, "storage": storage, "database_url": "sqlite:///" + (tmp_path / "test.db").as_posix(),
             "operator_username": "admin", "password": "test-operator-password",
             "session_secret": "test-secret-" * 5,
             "secure_cookie": False, "max_upload_bytes": 20 * 1024**2, "min_free_bytes": 0,
@@ -34,6 +34,11 @@ def settings(tmp_path):
 @pytest.fixture
 def client(settings):
     with TestClient(create_app(settings)) as connection:
+        # Functional camera tests must not depend on the developer host's load.
+        # Dedicated resource_guard tests cover refusal and preservation behavior.
+        connection.app.state.resource_guard = SimpleNamespace(snapshot=lambda: {
+            "admit_new": True, "optional_processing": True, "level": "normal",
+            "thresholds": [75,80,85], "unknown": [], "host_telemetry_stale": False})
         yield connection
 
 

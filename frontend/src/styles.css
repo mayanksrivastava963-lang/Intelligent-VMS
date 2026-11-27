@@ -1229,6 +1229,7 @@ tbody tr:hover { background: #ffffff07; }
 .status { border: 1px solid #ffffff0d; }
 .status.ready { background: #123f3b; color: #80edc5; }
 .status.failed { background: #482b3c; color: #ffadbf; }
+.status.protected { background: #1d3654; color: #93c5fd; border-color: #2f5682; }
 .status.processing, .status.queued, .status.uploading { background: #443d25; color: #f0d487; }
 .upload-zone {
   border-color: #3b6477;

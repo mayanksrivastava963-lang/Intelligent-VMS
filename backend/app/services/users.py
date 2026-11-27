@@ -1,7 +1,8 @@
 import time
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.core.security import hash_password
 from backend.app.models.users import (
@@ -40,7 +41,7 @@ PERMISSION_DESCRIPTIONS = {
     "camera.read": "View cameras and live feeds",
     "camera.manage": "Add, control, and remove cameras",
     "recording.read": "View and play recordings",
-    "recording.manage": "Upload, retry, and manage recordings",
+    "recording.manage": "Manage recordings",
     "user.read": "View user accounts",
     "user.manage": "Create and manage user accounts",
     "role.read": "View application roles",
@@ -54,15 +55,32 @@ PERMISSION_DESCRIPTIONS = {
 }
 
 
+def _insert_ignore_conflict(connection, statement):
+    try:
+        with connection.begin_nested():
+            connection.execute(statement)
+            return True
+    except IntegrityError:
+        return False
+
+
 def initialize_user_database(engine, username, password_hash, password=""):
     with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(text("SELECT pg_advisory_xact_lock(1867087102)"))
         for role_id, display_name in ROLE_NAMES.items():
             if connection.execute(select(roles.c.id).where(roles.c.id == role_id)).first() is None:
-                connection.execute(roles.insert().values(id=role_id, display_name=display_name))
+                _insert_ignore_conflict(
+                    connection,
+                    roles.insert().values(id=role_id, display_name=display_name),
+                )
 
         for permission_id, description in PERMISSION_DESCRIPTIONS.items():
             if connection.execute(select(permissions.c.id).where(permissions.c.id == permission_id)).first() is None:
-                connection.execute(permissions.insert().values(id=permission_id, description=description))
+                _insert_ignore_conflict(
+                    connection,
+                    permissions.insert().values(id=permission_id, description=description),
+                )
 
         for role_id, permission_ids in ROLE_PERMISSIONS.items():
             for permission_id in permission_ids:
@@ -73,29 +91,35 @@ def initialize_user_database(engine, username, password_hash, password=""):
                     )
                 ).first()
                 if existing is None:
-                    connection.execute(role_permissions.insert().values(
-                        role_id=role_id, permission_id=permission_id
-                    ))
+                    _insert_ignore_conflict(
+                        connection,
+                        role_permissions.insert().values(
+                            role_id=role_id, permission_id=permission_id
+                        ),
+                    )
 
-        existing_admin = connection.execute(
-            select(users.c.id).where(users.c.username == username.casefold())
-        ).first()
+        # Configuration is a one-time bootstrap, never an account recovery API.
+        existing_admin = connection.execute(select(users.c.id).limit(1)).first()
         if existing_admin is None:
             stored_hash = password_hash or hash_password(password)
             now = time.time()
             user_id = str(uuid4())
-            connection.execute(users.insert().values(
-                id=user_id,
-                full_name="System Administrator",
-                username=username.casefold(),
-                email=f"{username.casefold()}@local.invalid",
-                password_hash=stored_hash,
-                role_id="super_administrator",
-                is_active=True,
-                created_at=now,
-                updated_at=now,
-            ))
-            add_audit(connection, "initial_admin_created", target_user_id=user_id)
+            inserted = _insert_ignore_conflict(
+                connection,
+                users.insert().values(
+                    id=user_id,
+                    full_name="System Administrator",
+                    username=username.casefold(),
+                    email=f"{username.casefold()}@local.invalid",
+                    password_hash=stored_hash,
+                    role_id="super_administrator",
+                    is_active=True,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            )
+            if inserted:
+                add_audit(connection, "initial_admin_created", target_user_id=user_id)
 
 
 def add_audit(connection, action, target_user_id=None, outcome="success", remote_address=None, actor_user_id=None):

@@ -5,6 +5,8 @@ rtmp: false
 srt: false
 api: true
 apiAddress: :9997
+metrics: true
+metricsAddress: :9998
 hls: true
 hlsAddress: :8888
 hlsVariant: lowLatency
@@ -27,8 +29,4 @@ authInternalUsers:
     permissions:
       - action: read
       - action: playback
-      - action: publish
-        path: "~^benchmark-[0-9]+$"
-paths:
-  "~^benchmark-[0-9]+$":
-    source: publisher
+paths: {}

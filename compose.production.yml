@@ -1,0 +1,215 @@
+name: ${COMPOSE_PROJECT_NAME:-intelligent-vms}
+
+x-environment: &environment
+  RECORDING_DATABASE: postgres
+  POSTGRES_HOST: ${POSTGRES_HOST:?Configure an external PostgreSQL host}
+  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  POSTGRES_USER: ${POSTGRES_USER:?Set database user}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set database password}
+  POSTGRES_DB: ${POSTGRES_DB:?Set database name}
+  VMS_OPERATOR_USERNAME: ${VMS_OPERATOR_USERNAME:?Set administrator username}
+  VMS_OPERATOR_PASSWORD: ${VMS_OPERATOR_PASSWORD:?Set administrator password}
+  VMS_SESSION_SECRET: ${VMS_SESSION_SECRET:?Set stable random encryption/session secret}
+  VMS_SECURE_COOKIE: 'true'
+  VMS_SCHEMA_MANAGED: 'true'
+  VMS_CAMERA_NETWORKS: ${VMS_CAMERA_NETWORKS:?Set approved camera CIDRs}
+  RECORDING_STORAGE_PATH: /app/storage/recordings
+  RECORDING_SEGMENT_SECONDS: ${RECORDING_SEGMENT_SECONDS:-1800}
+  RECORDING_RETENTION_DAYS: ${RECORDING_RETENTION_DAYS:-30}
+  RETENTION_FREE_HIGH_BYTES: ${RETENTION_FREE_HIGH_BYTES:-11811160064}
+  RETENTION_CYCLE_SECONDS: ${RETENTION_CYCLE_SECONDS:-3600}
+  VMS_MAX_RECORDERS: ${VMS_MAX_RECORDERS:-16}
+  VMS_MAX_ADMITTED_CAMERAS: ${VMS_MAX_ADMITTED_CAMERAS:-${VMS_MAX_RECORDERS:-16}}
+  VMS_RECORDER_ID: ${VMS_RECORDER_ID:-primary}
+  VMS_RECORDER_MODE: ${VMS_RECORDER_MODE:-single}
+  RECORDER_SHARD_INDEX: ${RECORDER_SHARD_INDEX:-0}
+  RECORDER_SHARD_TOTAL: ${RECORDER_SHARD_TOTAL:-1}
+  RECORDER_TAKEOVER_SECONDS: ${RECORDER_TAKEOVER_SECONDS:-30}
+  VMS_RESOURCE_WARN: ${VMS_RESOURCE_WARN:-75}
+  VMS_RESOURCE_REDUCE: ${VMS_RESOURCE_REDUCE:-80}
+  VMS_RESOURCE_BLOCK: ${VMS_RESOURCE_BLOCK:-85}
+  VMS_RESOURCE_HYSTERESIS: ${VMS_RESOURCE_HYSTERESIS:-3}
+  VMS_NETWORK_INTERFACE: ${VMS_NETWORK_INTERFACE:-}
+  VMS_NETWORK_MBPS: ${VMS_NETWORK_MBPS:-0}
+  VMS_REQUIRED_METRICS: ${VMS_REQUIRED_METRICS:-}
+  VMS_HOST_RESOURCE_FILE: ${VMS_HOST_RESOURCE_FILE:-}
+  VMS_AI_AVAILABLE: ${VMS_AI_AVAILABLE:-false}
+  AI_MAX_CAMERAS: ${VMS_AI_MAX_CAMERAS:-4}
+  AI_BATCH_SIZE: ${VMS_AI_BATCH_SIZE:-4}
+  AI_SAMPLE_INTERVAL_MS: ${VMS_AI_SAMPLE_INTERVAL_MS:-2000}
+  MIN_FREE_BYTES: ${MIN_FREE_BYTES:-2147483648}
+  MEDIAMTX_API_URL: http://mediamtx:9997
+  MEDIAMTX_API_USER: vms-api
+  MEDIAMTX_API_PASSWORD: ${MEDIAMTX_API_PASSWORD:?Set media API secret}
+  MEDIAMTX_RTSP_URL: rtsp://vms-media:${MEDIAMTX_MEDIA_PASSWORD:?Set media reader secret}@mediamtx:8554
+  REDIS_URL: redis://redis:6379/0
+  VMS_TRUSTED_PROXY_CIDRS: ${VMS_CONTROL_SUBNET:-172.30.85.0/24}
+  DB_POOL_SIZE: ${VMS_DB_POOL_SIZE:-3}
+  DB_MAX_OVERFLOW: ${VMS_DB_MAX_OVERFLOW:-2}
+  RTSP_RECORD_AUDIO_MODE: ${RTSP_RECORD_AUDIO_MODE:-aac}
+
+x-service: &service
+  restart: unless-stopped
+  init: true
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: local
+    options: {max-size: 10m, max-file: '3'}
+
+services:
+  recording-init:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        VMS_BUILD_VERSION: ${VMS_BUILD_VERSION:-0.1.0-rc3}
+        VMS_BUILD_SHA: ${VMS_BUILD_SHA:-local}
+        VMS_BUILD_TIMESTAMP: ${VMS_BUILD_TIMESTAMP:-}
+    image: intelligent-vms-api:0.1.0
+    environment: *environment
+    volumes: [recording_data:/app/storage]
+    networks: [control, egress]
+    command: [python, -m, alembic, -c, backend/alembic.ini, upgrade, head]
+    mem_limit: 512m
+
+  recording-api:
+    <<: *service
+    image: intelligent-vms-api:0.1.0
+    environment: *environment
+    volumes: [recording_data:/app/storage]
+    networks: [control, egress]
+    mem_limit: ${VMS_API_MEMORY:-768m}
+    cpus: ${VMS_API_CPUS:-2}
+    pids_limit: ${VMS_API_PIDS:-128}
+    depends_on:
+      recording-init: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      mediamtx: {condition: service_started}
+    command: [uvicorn, backend.app.main:app, --host, 0.0.0.0, --port, '8000', --workers, '${VMS_API_WORKERS:-2}']
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  rtsp-recorder:
+    <<: *service
+    image: intelligent-vms-api:0.1.0
+    environment: *environment
+    volumes: [recording_data:/app/storage]
+    networks: [control, egress]
+    mem_limit: ${VMS_RECORDER_MEMORY:-2g}
+    cpus: ${VMS_RECORDER_CPUS:-4}
+    pids_limit: ${VMS_RECORDER_PIDS:-256}
+    command: [python, -m, services.recording_engine.rtsp_recorder]
+    depends_on:
+      recording-api: {condition: service_healthy}
+    stop_grace_period: 60s
+    healthcheck:
+      test: [CMD, python, -c, "import time; from pathlib import Path; p=Path('/tmp/vms-recorder.heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<45"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  storage-retention:
+    <<: *service
+    image: intelligent-vms-api:0.1.0
+    environment: *environment
+    volumes: [recording_data:/app/storage]
+    networks: [control, egress]
+    mem_limit: ${VMS_RETENTION_MEMORY:-512m}
+    cpus: ${VMS_RETENTION_CPUS:-1}
+    command: [python, -m, services.recording_engine.retention]
+    depends_on:
+      recording-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import time; from pathlib import Path; p=Path('/tmp/vms-retention.heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<120"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ai-worker:
+    <<: *service
+    profiles: [ai]
+    build: {context: ., dockerfile: services/ai_engine/Dockerfile}
+    image: intelligent-vms-ai:0.1.0
+    environment:
+      <<: *environment
+      VMS_AI_AVAILABLE: 'true'
+      AI_DEVICE: ${VMS_AI_DEVICE:-cpu}
+      AI_GPU_MEMORY_FRACTION: ${VMS_AI_GPU_MEMORY_FRACTION:-0.5}
+    volumes:
+      - recording_data:/app/storage
+      - ai_model_cache:/home/aiworker/.cache/torch
+    networks: [control, egress]
+    mem_limit: ${VMS_AI_MEMORY:-4g}
+    cpus: ${VMS_AI_CPUS:-4}
+    depends_on:
+      recording-init: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      mediamtx: {condition: service_started}
+    healthcheck:
+      test: [CMD, python, -c, "import time; from pathlib import Path; p=Path('/tmp/vms-ai-worker.heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<45"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    <<: *service
+    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    command: [redis-server, --appendonly, 'yes', --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    volumes: [redis_data:/data]
+    networks: [control]
+    mem_limit: 256m
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  mediamtx:
+    <<: *service
+    image: bluenviron/mediamtx:1.21.4@sha256:c730bccdbc8739f8f0c13cefe9bea8b61926f599b88fa4d0d229baa91846c7bc
+    environment:
+      MTX_AUTHINTERNALUSERS_0_PASS: ${MEDIAMTX_API_PASSWORD}
+      MTX_AUTHINTERNALUSERS_1_PASS: ${MEDIAMTX_MEDIA_PASSWORD}
+      MTX_WEBRTCADDITIONALHOSTS: ${VMS_PUBLIC_HOST:-localhost}
+    volumes: [./infrastructure/mediamtx/production.yml:/mediamtx.yml:ro]
+    networks: [control, egress]
+    mem_limit: ${VMS_MEDIA_MEMORY:-1g}
+    cpus: ${VMS_MEDIA_CPUS:-2}
+    ports: ['${VMS_BIND_ADDRESS:-127.0.0.1}:8189:8189/udp']
+
+  nginx:
+    <<: *service
+    build: {context: ., dockerfile: infrastructure/nginx/production.Dockerfile}
+    image: intelligent-vms-web:0.1.0
+    environment:
+      VMS_MEDIA_AUTH: ${VMS_MEDIA_AUTH:?Set base64 media service authorization}
+      NGINX_ENVSUBST_FILTER: VMS_MEDIA_AUTH
+    volumes: ['${VMS_TLS_DIRECTORY:?Set TLS directory}:/etc/nginx/tls:ro']
+    networks: [control, frontend]
+    mem_limit: 128m
+    ports: ['${VMS_BIND_ADDRESS:-127.0.0.1}:${VMS_HTTPS_PORT:-8443}:443']
+    depends_on:
+      recording-api: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, --no-check-certificate, -q, -O, /dev/null, 'https://127.0.0.1/api/health']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+networks:
+  control:
+    internal: true
+    ipam:
+      config: [{subnet: '${VMS_CONTROL_SUBNET:-172.30.85.0/24}'}]
+  egress: {}
+  frontend: {}
+volumes:
+  recording_data:
+    name: ${VMS_RECORDING_VOLUME:-intelligent-vms-recordings}
+  redis_data:
+    name: ${VMS_REDIS_VOLUME:-intelligent-vms-redis}
+  ai_model_cache:
+    name: ${VMS_AI_CACHE_VOLUME:-intelligent-vms-ai-cache}

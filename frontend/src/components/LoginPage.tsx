@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-import type { CSSProperties, FormEvent, PointerEvent } from "react";
+import { useEffect, useState, type CSSProperties, type FormEvent, type PointerEvent } from "react";
 import Icon from "./Icon";
 import "../login.css";
 
@@ -65,7 +64,7 @@ export default function LoginPage({
           </div>
           <div className="login-status-pill">
             <i aria-hidden="true" />
-            CONTROL NODE ONLINE
+            AUTHORIZED ACCESS
           </div>
         </div>
 
@@ -80,7 +79,7 @@ export default function LoginPage({
             <span className="login-accent">.</span>
           </h1>
           <p>
-            Monitor your virtual cameras, inspect segmented recordings, and
+            Monitor your network cameras, inspect stored recordings, and
             track host resources in real time from one private workspace.
           </p>
 
@@ -113,10 +112,10 @@ export default function LoginPage({
                 </div>
                 <div className="stage-scanline" />
                 <div className="stage-target stage-target-a">
-                  <span>CAM-01 · ACTIVE</span>
+                  <span>CAMERA MONITORING</span>
                 </div>
                 <div className="stage-target stage-target-b">
-                  <span>ZONE-B · LOCKED</span>
+                  <span>RECORDING REVIEW</span>
                 </div>
                 <div className="stage-center-mark">＋</div>
                 <div className="stage-corners">
@@ -128,7 +127,7 @@ export default function LoginPage({
               </div>
 
               <div className="stage-footer">
-                <span>◉ Camera overview · Authorized preview</span>
+                <span>Intelligent-VMS</span>
                 <span className="stage-bars">
                   <i />
                   <i />
@@ -150,11 +149,11 @@ export default function LoginPage({
         </div>
 
         <div className="login-bottom-meta">
-          <span>INTELLIGENT VMS / MONITORING &amp; MANAGEMENT</span>
+          <span>Intelligent-VMS / MONITORING &amp; MANAGEMENT</span>
           <div className="login-feature-chips">
             <span>RBAC SECURITY</span>
             <span>AUDIT LOGS</span>
-            <span>VIRTUAL CAMERAS</span>
+            <span>NETWORK CAMERAS</span>
           </div>
         </div>
       </section>

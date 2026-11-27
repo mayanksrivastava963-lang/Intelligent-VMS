@@ -8,6 +8,8 @@ export type Recording = {
   segment_seconds: number;
   progress: number;
   error: string | null;
+  camera_id?: string | null;
+  protected?: boolean;
 };
 
 export type Segment = {
@@ -22,6 +24,7 @@ export type Segment = {
 
 export type RecordingDetail = Recording & { segments: Segment[] };
 export type Camera = {
+  ai_available?: boolean;
   id: string;
   video_id: string | null;
   name: string;
@@ -30,6 +33,7 @@ export type Camera = {
   has_substream?: boolean;
   status: "running" | "stopped";
   ai_enabled: boolean;
+  recording_status?: string;
   connection_status?: "connecting" | "online" | "reconnecting" | "offline" | "stopped";
   filename: string;
   duration_seconds: number | null;
@@ -122,47 +126,4 @@ export async function api<T>(
     );
   }
   return response.json() as Promise<T>;
-}
-
-export function uploadVideo(
-  file: File,
-  progress: (percent: number) => void,
-  finished: (recording: Recording | null, error: string | null) => void,
-) {
-  const request = new XMLHttpRequest();
-  request.open("POST", "/api/videos");
-  request.setRequestHeader("X-VMS-Request", "1");
-  request.setRequestHeader("X-Filename", encodeURIComponent(file.name));
-  request.setRequestHeader("Content-Type", "application/octet-stream");
-  request.upload.onprogress = (event) => {
-    if (event.lengthComputable)
-      progress(Math.round((100 * event.loaded) / event.total));
-  };
-  request.onload = () => {
-    let body;
-    try {
-      body = JSON.parse(request.responseText);
-    } catch {
-      body = null;
-    }
-    if (request.status === 202 && body) finished(body, null);
-    else {
-      if (request.status === 401)
-        window.dispatchEvent(new Event("session-expired"));
-      finished(
-        null,
-        typeof body?.detail === "string"
-          ? body.detail
-          : `Upload failed (${request.status})`,
-      );
-    }
-  };
-  request.onerror = () =>
-    finished(
-      null,
-      "Connection lost. Check the library before uploading again.",
-    );
-  request.onabort = () => finished(null, "Upload cancelled.");
-  request.send(file);
-  return request;
 }

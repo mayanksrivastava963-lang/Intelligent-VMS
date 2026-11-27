@@ -1,0 +1,35 @@
+# Optional bundled PostgreSQL for small single-server deployments
+# Usage: docker compose -f compose.production.yml -f compose.bundled-db.yml up -d
+name: ${COMPOSE_PROJECT_NAME:-intelligent-vms}
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    init: true
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: local
+      options: {max-size: 10m, max-file: '3'}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [control]
+    mem_limit: ${VMS_DB_MEMORY:-1g}
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  recording-init:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    name: ${VMS_POSTGRES_VOLUME:-intelligent-vms-postgres}

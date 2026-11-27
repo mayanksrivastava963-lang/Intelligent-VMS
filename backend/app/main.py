@@ -19,19 +19,21 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.app.core.config import load_settings
 from backend.app.services.system_metrics import read_system_metrics
+from backend.app.services.resource_guard import ResourceGuard
+from backend.app.services.rtsp import admit_rtsp_camera
 from backend.app.services.login_limiter import LoginLimiter
 from backend.app.services.camera_ai import (InvalidFrame, detect_jpeg, enabled_camera_ids,
                                             is_enabled, remove_camera_setting, set_enabled)
 from backend.app.services.rtsp import (MediaMTXHub, StreamHub, create_rtsp_camera, get_rtsp_camera,
                                        list_rtsp_cameras, public_camera, update_rtsp_camera,
-                                       valid_rtsp_url)
+                                       valid_rtsp_url, allowed_camera_url, cipher)
 from backend.app.database.session import create_database
 from backend.app.core.security import hash_password, password_needs_rehash, verify_password
-from backend.app.models.recordings import alerts, cameras, segments, videos
+from backend.app.models.recordings import alerts, cameras, recorder_workers, segments, videos
 from backend.app.models.users import audit_logs, user_sessions, users as users_table
 from backend.app.services.recordings import (
     create_camera,
@@ -41,6 +43,7 @@ from backend.app.services.recordings import (
     list_cameras,
     list_videos,
     set_camera_status,
+    set_video_protection,
 )
 from backend.app.services.users import (
     ROLE_NAMES,
@@ -89,6 +92,10 @@ class CameraAIRequest(BaseModel):
     enabled: bool
 
 
+class VideoProtectionRequest(BaseModel):
+    protected: bool
+
+
 class UserCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
     username: str = Field(min_length=3, max_length=64)
@@ -114,7 +121,7 @@ def create_app(settings=None):
         app.state.settings = settings or load_settings()
         if not app.state.settings.get("operator_password_hash"):
             app.state.settings["operator_password_hash"] = hash_password(
-                app.state.settings["password"]
+                app.state.settings.get("operator_password") or app.state.settings.get("password", "")
             )
         app.state.engine = create_database(
             app.state.settings["database_url"],
@@ -143,6 +150,7 @@ def create_app(settings=None):
                                                 socket_connect_timeout=2, socket_timeout=2)
                                 if app.state.settings.get("redis_url") else None)
         app.state.metrics_lock = Lock()
+        app.state.resource_guard = ResourceGuard(app.state.settings)
         app.state.inference_slot = BoundedSemaphore(1)
         app.state.ai_sample_lock = Lock()
         app.state.ai_sample_times = {}
@@ -152,7 +160,10 @@ def create_app(settings=None):
         for camera in list_rtsp_cameras(app.state.engine):
             if camera["status"] == "running":
                 try:
+                    validate_stored_camera(app.state, camera["id"])
                     app.state.stream_hub.start(camera["id"])
+                except HTTPException:
+                    update_rtsp_camera(app.state.engine, camera["id"], "stopped")
                 except RuntimeError:
                     pass
         try:
@@ -161,7 +172,21 @@ def create_app(settings=None):
             app.state.stream_hub.close()
             app.state.engine.dispose()
 
-    app = FastAPI(title="Intelligent VMS API", lifespan=lifespan, redoc_url=None)
+    internal_test_tools = bool(settings and settings.get("internal_test_tools", False))
+    app = FastAPI(title="Intelligent-VMS API", lifespan=lifespan, redoc_url=None,
+                  docs_url="/docs" if internal_test_tools else None,
+                  openapi_url="/openapi.json" if internal_test_tools else None)
+
+    def validate_camera_source(state, url):
+        if not internal_test_tools and not allowed_camera_url(url, state.settings.get("camera_networks", [])):
+            raise HTTPException(400, "Use a camera IP address within the configured authorized networks")
+
+    def validate_stored_camera(state, camera_id):
+        row = get_rtsp_camera(state.engine, camera_id)
+        for field in ("source_encrypted", "preview_source_encrypted"):
+            if row and row[field]:
+                source = cipher(state.settings["session_secret"]).decrypt(row[field].encode()).decode()
+                validate_camera_source(state, source)
 
     @app.exception_handler(RequestValidationError)
     async def hide_validation_input(_request, _error):
@@ -213,6 +238,27 @@ def create_app(settings=None):
             connection.execute(select(1))
         return {"status": "ok"}
 
+    @app.get("/api/version")
+    def version():
+        return {"version": os.getenv("VMS_BUILD_VERSION", "0.1.0-rc3"),
+                "build": os.getenv("VMS_BUILD_SHA", "dev"),
+                "built_at": os.getenv("VMS_BUILD_TIMESTAMP", "")}
+
+    def ai_worker_online(state):
+        if state.ai_results is None:
+            return None
+        try:
+            return bool(state.ai_results.get("vms:ai:worker:heartbeat"))
+        except RedisError:
+            return False
+
+    def is_ai_available(state):
+        if internal_test_tools:
+            return True
+        if state.settings.get("ai_available", False):
+            return True
+        return bool(ai_worker_online(state))
+
     @app.get("/api/system/metrics", dependencies=[Depends(require_permission("health.read"))])
     def system_metrics(request: Request):
         state = request.app.state
@@ -223,7 +269,20 @@ def create_app(settings=None):
                 except (OSError, psutil.Error):
                     raise HTTPException(503, "System metrics are temporarily unavailable") from None
                 state.metrics_sample_time = time.monotonic()
-            return state.metrics_cache
+            workers = []
+            try:
+                with state.engine.connect() as connection:
+                    workers = [dict(row) for row in connection.execute(
+                        select(recorder_workers).order_by(recorder_workers.c.id)
+                    ).mappings()]
+            except SQLAlchemyError:
+                workers = []
+            return {
+                **state.metrics_cache,
+                "resource_policy": state.resource_guard.snapshot(),
+                "recorder_workers": workers,
+                "ai_worker_online": ai_worker_online(state),
+            }
 
     @app.post("/api/auth/login", dependencies=[Depends(require_write_header)])
     async def login(request: Request, response: Response):
@@ -295,8 +354,7 @@ def create_app(settings=None):
         session = request.app.state.signer.loads(request.cookies.get(COOKIE, ""), max_age=8 * 3600)
         with request.app.state.engine.begin() as connection:
             connection.execute(delete(user_sessions).where(user_sessions.c.id == session["session_id"]))
-            remote_address = request.client.host if request.client else None
-            add_audit(connection, "logout", target_user_id=user["id"], remote_address=remote_address,
+            add_audit(connection, "logout", target_user_id=user["id"], remote_address=client_address(request),
                       actor_user_id=user["id"])
         response.delete_cookie(COOKIE)
         return {"authenticated": False}
@@ -340,7 +398,7 @@ def create_app(settings=None):
                     created_at=now,
                     updated_at=now,
                 ))
-                add_audit(connection, "user_created", target_user_id=user_id, remote_address=request.client.host if request.client else None,
+                add_audit(connection, "user_created", target_user_id=user_id, remote_address=client_address(request),
                           actor_user_id=actor["id"])
         except IntegrityError:
             raise HTTPException(409, "Username or email is already in use") from None
@@ -375,7 +433,7 @@ def create_app(settings=None):
                 if changes.get("is_active") is False:
                     connection.execute(delete(user_sessions).where(user_sessions.c.user_id == user_id))
                 add_audit(connection, "user_updated", target_user_id=user_id,
-                          remote_address=request.client.host if request.client else None,
+                          remote_address=client_address(request),
                           actor_user_id=actor["id"])
         except IntegrityError:
             raise HTTPException(409, "Email address is already in use") from None
@@ -397,7 +455,7 @@ def create_app(settings=None):
             ))
             connection.execute(delete(user_sessions).where(user_sessions.c.user_id == user_id))
             add_audit(connection, "password_reset", target_user_id=user_id,
-                      remote_address=request.client.host if request.client else None,
+                      remote_address=client_address(request),
                       actor_user_id=actor["id"])
         return {"updated": True}
 
@@ -412,10 +470,11 @@ def create_app(settings=None):
         return list_audit_logs(request.app.state.engine, limit)
 
     @app.get("/api/videos", dependencies=[Depends(require_permission("recording.read"))])
-    def index(request: Request, limit: int = 100, offset: int = 0):
+    def index(request: Request, limit: int = 100, offset: int = 0,
+              camera_id: str | None = None, q: str | None = None):
         if not 1 <= limit <= 100 or offset < 0:
             raise HTTPException(400, "Invalid pagination")
-        return list_videos(request.app.state.engine, limit, offset)
+        return list_videos(request.app.state.engine, limit, offset, camera_id=camera_id, query_text=q)
 
     @app.get("/api/videos/{video_id}", dependencies=[Depends(require_permission("recording.read"))])
     def detail(video_id: str, request: Request):
@@ -423,6 +482,22 @@ def create_app(settings=None):
         if result is None:
             raise HTTPException(404, "Recording not found")
         return result
+
+    @app.put("/api/videos/{video_id}/protection",
+             dependencies=[Depends(require_permission("recording.manage")), Depends(require_write_header)])
+    def update_video_protection(video_id: str, body: VideoProtectionRequest, request: Request):
+        engine = request.app.state.engine
+        if not set_video_protection(engine, video_id, body.protected):
+            raise HTTPException(404, "Recording not found")
+        with engine.begin() as connection:
+            add_audit(
+                connection,
+                "recording_protected" if body.protected else "recording_unprotected",
+                outcome="success",
+                actor_user_id=request.state.user["id"],
+                remote_address=client_address(request),
+            )
+        return {"id": video_id, "protected": body.protected}
 
     @app.post("/api/videos", status_code=202,
               dependencies=[Depends(require_permission("recording.manage")), Depends(require_write_header)])
@@ -502,7 +577,7 @@ def create_app(settings=None):
             raise HTTPException(400, "Invalid pagination")
         enabled = enabled_camera_ids(request.app.state.engine)
         engine = request.app.state.engine
-        virtual_total = count_cameras(engine)
+        virtual_total = count_cameras(engine) if internal_test_tools else 0
         virtual_limit = max(0, min(limit, virtual_total - offset))
         virtual = list_cameras(engine, virtual_limit, offset) if virtual_limit else []
         physical_limit = limit - len(virtual)
@@ -514,9 +589,15 @@ def create_app(settings=None):
         for camera in physical:
             if camera["status"] == "running":
                 camera["connection_status"] = statuses[camera["id"]] if statuses is not None else hub.status(camera["id"])
+        available = is_ai_available(request.app.state)
         for camera in virtual + physical:
-            camera["ai_enabled"] = camera["id"] in enabled
+            camera["ai_available"] = available
+            camera["ai_enabled"] = camera["id"] in enabled and camera["ai_available"]
         return virtual + physical
+
+    @app.get("/api/resource-status", dependencies=[Depends(require_permission("health.read"))])
+    def resource_status(request: Request):
+        return request.app.state.resource_guard.snapshot()
 
     @app.get("/api/stream-access", dependencies=[Depends(require_permission("camera.read"))])
     def stream_access(request: Request):
@@ -528,6 +609,8 @@ def create_app(settings=None):
         camera = get_rtsp_camera(request.app.state.engine, match.group(1))
         if not camera or camera["status"] != "running":
             raise HTTPException(403, "Stream access denied")
+        if original.split("?", 1)[0].endswith(("/index.m3u8", "/whep")) and not request.app.state.resource_guard.snapshot()["admit_new"]:
+            raise HTTPException(403, "New preview sessions paused to protect recording")
         return Response(status_code=204)
 
     @app.post("/api/cameras/rtsp", status_code=201,
@@ -537,6 +620,9 @@ def create_app(settings=None):
             raise HTTPException(400, "Enter a camera name and a valid rtsp:// URL")
         if body.preview_url and (len(body.preview_url) > 2000 or not valid_rtsp_url(body.preview_url)):
             raise HTTPException(400, "Enter a valid rtsp:// substream URL")
+        validate_camera_source(request.app.state, body.url)
+        if body.preview_url:
+            validate_camera_source(request.app.state, body.preview_url)
         engine = request.app.state.engine
         camera_id = create_rtsp_camera(engine, request.app.state.settings["session_secret"],
                                        body.name.strip(), body.location.strip(), body.url, body.preview_url)
@@ -585,7 +671,19 @@ def create_app(settings=None):
             raise HTTPException(404, "Camera action not found")
         status = "stopped" if action == "stop" else "running"
         engine = request.app.state.engine
-        if get_rtsp_camera(engine, camera_id):
+        existing = get_rtsp_camera(engine, camera_id)
+        if existing:
+            if action != "stop" and existing["status"] != "running":
+                if not request.app.state.resource_guard.snapshot()["admit_new"]:
+                    raise HTTPException(503, "Resource pressure: new cameras paused; existing recordings continue", headers={"Retry-After": "10"})
+            if action != "stop":
+                validate_stored_camera(request.app.state, camera_id)
+                admission_limit = request.app.state.settings.get(
+                    "max_admitted_cameras",
+                    request.app.state.settings.get("max_recorders", 16),
+                )
+                if not admit_rtsp_camera(engine, camera_id, admission_limit):
+                    raise HTTPException(409, "Configured recording admission limit reached; existing recordings continue")
             update_rtsp_camera(engine, camera_id, status)
             hub = request.app.state.stream_hub
             try:
@@ -600,7 +698,7 @@ def create_app(settings=None):
                 raise HTTPException(503, "Media server is temporarily unavailable") from None
             return {**public_camera(get_rtsp_camera(engine, camera_id), hub.status(camera_id)),
                     "ai_enabled": is_enabled(engine, camera_id)}
-        if not set_camera_status(request.app.state.engine, camera_id, status):
+        if not internal_test_tools or not set_camera_status(request.app.state.engine, camera_id, status):
             raise HTTPException(404, "Camera not found")
         camera = next(camera for camera in list_cameras(request.app.state.engine) if camera["id"] == camera_id)
         camera["ai_enabled"] = is_enabled(request.app.state.engine, camera_id)
@@ -618,7 +716,7 @@ def create_app(settings=None):
             with state.ai_sample_lock:
                 state.ai_sample_times.pop(camera_id, None)
             return {"deleted": True}
-        if not delete_camera(request.app.state.engine, camera_id):
+        if not internal_test_tools or not delete_camera(request.app.state.engine, camera_id):
             raise HTTPException(404, "Camera not found")
         remove_camera_setting(request.app.state.engine, camera_id)
         with state.ai_sample_lock:
@@ -630,10 +728,16 @@ def create_app(settings=None):
     def camera_ai_switch(camera_id: str, body: CameraAIRequest, request: Request):
         engine = request.app.state.engine
         if not get_rtsp_camera(engine, camera_id):
+            if not internal_test_tools:
+                raise HTTPException(404, "Camera not found")
             with engine.connect() as connection:
                 exists = connection.execute(select(cameras.c.id).where(cameras.c.id == camera_id)).first()
             if exists is None:
                 raise HTTPException(404, "Camera not found")
+        if body.enabled and not is_ai_available(request.app.state):
+            raise HTTPException(503, "AI analytics is not configured for this deployment")
+        if body.enabled and not request.app.state.resource_guard.snapshot()["optional_processing"]:
+            raise HTTPException(503, "AI processing paused to protect recording", headers={"Retry-After": "10"})
         set_enabled(engine, camera_id, body.enabled)
         return {"camera_id": camera_id, "ai_enabled": body.enabled}
 
@@ -647,12 +751,15 @@ def create_app(settings=None):
             raise HTTPException(503, "AI worker is not configured")
         try:
             result = redis.get("vms:ai:" + camera_id)
+            worker_online = bool(redis.get("vms:ai:worker:heartbeat"))
         except RedisError:
             raise HTTPException(503, "AI results are temporarily unavailable") from None
         if result is None:
             return {"width": 0, "height": 0, "detections": [],
-                    "processed_at": 0, "inference_ms": 0}
-        return json.loads(result)
+                    "processed_at": 0, "inference_ms": 0, "worker_online": worker_online}
+        payload = json.loads(result)
+        payload["worker_online"] = worker_online
+        return payload
 
     @app.get("/api/alerts", dependencies=[Depends(require_permission("alerts.read"))])
     def alerts_index(request: Request, limit: int = 100, offset: int = 0, camera_id: str | None = None):
@@ -673,7 +780,8 @@ def create_app(settings=None):
             ).values(acknowledged_at=time.time(), acknowledged_by=request.state.user["id"]))
             if result.rowcount != 1:
                 raise HTTPException(404, "Unreviewed alert not found")
-            add_audit(connection, "alert_acknowledged", actor_user_id=request.state.user["id"])
+            add_audit(connection, "alert_acknowledged", actor_user_id=request.state.user["id"],
+                      remote_address=client_address(request))
         return {"acknowledged": True}
 
     @app.post("/api/cameras/{camera_id}/ai/detections",
@@ -736,6 +844,18 @@ def create_app(settings=None):
         return FileResponse(path, media_type="video/mp4", filename=f"segment-{row['number']:04d}.mp4",
                             content_disposition_type="inline")
 
+    # Internal ingestion and simulated-camera tests explicitly opt in through
+    # the app factory. No environment toggle can enable these production routes.
+    if not internal_test_tools:
+        internal_routes = {
+            ("/api/videos", "POST"),
+            ("/api/videos/{video_id}/retry", "POST"),
+            ("/api/cameras", "POST"),
+            ("/api/cameras/{camera_id}/ai/detections", "POST"),
+        }
+        app.router.routes[:] = [route for route in app.router.routes
+                               if not any((getattr(route, "path", ""), method) in internal_routes
+                                          for method in getattr(route, "methods", set()))]
     return app
 
 

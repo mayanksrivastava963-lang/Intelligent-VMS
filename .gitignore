@@ -37,6 +37,7 @@ redis_data/
 
 # Logs
 logs/
+releases/
 *.log
 
 # IDE

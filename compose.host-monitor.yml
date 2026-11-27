@@ -1,0 +1,11 @@
+# Host-owned telemetry directory; start scripts/host_resources.py on the HOST.
+# No host PID namespace, privileged container or Docker socket required.
+services:
+  recording-api:
+    environment:
+      VMS_HOST_RESOURCE_FILE: /run/vms-host/resources.json
+    volumes: ['${VMS_HOST_METRICS_DIRECTORY:?Set protected host telemetry directory}:/run/vms-host:ro']
+  rtsp-recorder:
+    environment:
+      VMS_HOST_RESOURCE_FILE: /run/vms-host/resources.json
+    volumes: ['${VMS_HOST_METRICS_DIRECTORY}:/run/vms-host:ro']

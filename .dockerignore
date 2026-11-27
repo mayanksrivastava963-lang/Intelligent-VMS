@@ -2,10 +2,16 @@
 .env
 .env.*
 **/.venv
+**/.venv-*
+**/tests
+**/test-runs
+**/benchmark-result.json
 **/node_modules
 **/__pycache__
 **/.pytest_cache
 storage
+releases
+docs/release-evidence
 logs
 frontend/dist
 services/ai_engine/.venv

@@ -1,0 +1,13 @@
+# BSD-3-Clause Valkey drop-in replacement overlay for Redis
+# Usage: docker compose -f compose.production.yml -f compose.valkey.yml up -d
+name: ${COMPOSE_PROJECT_NAME:-intelligent-vms}
+
+services:
+  redis:
+    image: valkey/valkey:8-alpine
+    command: [valkey-server, --appendonly, 'yes', --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    healthcheck:
+      test: [CMD, valkey-cli, ping]
+      interval: 10s
+      timeout: 3s
+      retries: 5

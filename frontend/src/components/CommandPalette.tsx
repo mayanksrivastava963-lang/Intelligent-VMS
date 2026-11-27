@@ -21,21 +21,17 @@ export function buildCommandItems({
   pages,
   cameras,
   recordings,
-  canUpload,
   onNavigate,
   onSelectCamera,
   onSelectRecording,
-  onUpload,
   onLogout,
 }: {
   pages: Array<{ id: string; label: string }>;
   cameras: Camera[];
   recordings: Recording[];
-  canUpload: boolean;
   onNavigate: (pageId: string) => void;
   onSelectCamera: (camera: Camera) => void;
   onSelectRecording: (recording: Recording) => void;
-  onUpload: () => void;
   onLogout: () => void;
 }): CommandItem[] {
   const list: CommandItem[] = [];
@@ -51,23 +47,12 @@ export function buildCommandItems({
     });
   }
 
-  if (canUpload) {
-    list.push({
-      id: "action-upload",
-      group: "Actions",
-      label: "Upload new video",
-      hint: "Add footage to library",
-      icon: "recordings",
-      onSelect: onUpload,
-    });
-  }
-
   for (const camera of cameras.slice(0, 8)) {
     list.push({
       id: `cam-${camera.id}`,
       group: "Cameras",
       label: camera.name,
-      hint: `${camera.location || "Virtual camera"} · ${camera.status}`,
+      hint: `${camera.location || "Location not set"} · ${camera.status}`,
       icon: "cameras",
       onSelect: () => onSelectCamera(camera),
     });

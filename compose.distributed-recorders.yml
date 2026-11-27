@@ -1,0 +1,62 @@
+# Enterprise distributed sharded recorder overlay (2+ recorder workers sharing PostgreSQL advisory per-camera locks)
+# Usage: docker compose -f compose.production.yml -f compose.distributed-recorders.yml up -d
+name: ${COMPOSE_PROJECT_NAME:-intelligent-vms}
+
+services:
+  rtsp-recorder:
+    environment:
+      VMS_RECORDER_ID: recorder-0
+      VMS_RECORDER_MODE: distributed
+      RECORDER_SHARD_INDEX: '0'
+      RECORDER_SHARD_TOTAL: '2'
+      VMS_MAX_ADMITTED_CAMERAS: ${VMS_MAX_ADMITTED_CAMERAS:-64}
+
+  rtsp-recorder-2:
+    restart: unless-stopped
+    init: true
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: local
+      options: {max-size: 10m, max-file: '3'}
+    image: intelligent-vms-api:0.1.0
+    environment:
+      RECORDING_DATABASE: postgres
+      POSTGRES_HOST: ${POSTGRES_HOST:?Configure PostgreSQL host}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:?Set database user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set database password}
+      POSTGRES_DB: ${POSTGRES_DB:?Set database name}
+      VMS_OPERATOR_USERNAME: ${VMS_OPERATOR_USERNAME:?Set administrator username}
+      VMS_OPERATOR_PASSWORD: ${VMS_OPERATOR_PASSWORD:?Set administrator password}
+      VMS_SESSION_SECRET: ${VMS_SESSION_SECRET:?Set encryption/session secret}
+      VMS_SCHEMA_MANAGED: 'true'
+      VMS_CAMERA_NETWORKS: ${VMS_CAMERA_NETWORKS:?Set approved camera CIDRs}
+      RECORDING_STORAGE_PATH: /app/storage/recordings
+      RECORDING_SEGMENT_SECONDS: ${RECORDING_SEGMENT_SECONDS:-1800}
+      VMS_MAX_RECORDERS: ${VMS_MAX_RECORDERS:-32}
+      VMS_MAX_ADMITTED_CAMERAS: ${VMS_MAX_ADMITTED_CAMERAS:-64}
+      VMS_RECORDER_ID: recorder-1
+      VMS_RECORDER_MODE: distributed
+      RECORDER_SHARD_INDEX: '1'
+      RECORDER_SHARD_TOTAL: '2'
+      RECORDER_TAKEOVER_SECONDS: ${RECORDER_TAKEOVER_SECONDS:-30}
+      MEDIAMTX_API_URL: http://mediamtx:9997
+      MEDIAMTX_API_USER: vms-api
+      MEDIAMTX_API_PASSWORD: ${MEDIAMTX_API_PASSWORD:?Set media API secret}
+      MEDIAMTX_RTSP_URL: rtsp://vms-media:${MEDIAMTX_MEDIA_PASSWORD:?Set media reader secret}@mediamtx:8554
+      RTSP_RECORD_AUDIO_MODE: ${RTSP_RECORD_AUDIO_MODE:-aac}
+      MIN_FREE_BYTES: ${MIN_FREE_BYTES:-2147483648}
+    volumes: [recording_data:/app/storage]
+    networks: [control, egress]
+    mem_limit: ${VMS_RECORDER_MEMORY:-2g}
+    cpus: ${VMS_RECORDER_CPUS:-4}
+    pids_limit: ${VMS_RECORDER_PIDS:-256}
+    command: [python, -m, services.recording_engine.rtsp_recorder]
+    depends_on:
+      recording-api: {condition: service_healthy}
+    stop_grace_period: 60s
+    healthcheck:
+      test: [CMD, python, -c, "import time; from pathlib import Path; p=Path('/tmp/vms-recorder.heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<45"]
+      interval: 15s
+      timeout: 5s
+      retries: 3

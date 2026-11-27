@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Column, Float, ForeignKey, Index, Integer, MetaData, String, Table, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Column, Float, ForeignKey, Index, Integer, MetaData, String, Table, UniqueConstraint
 
 
 metadata = MetaData()
@@ -17,7 +17,10 @@ videos = Table(
     Column("error", String(240)),
     Column("lease_token", String(36)),
     Column("attempts", Integer, nullable=False, default=0),
+    Column("camera_id", String(36)),
+    Column("protected", Boolean, nullable=False, default=False),
     Index("ix_recording_queue", "status", "created_at"),
+    Index("ix_recording_videos_camera_id", "camera_id", "created_at"),
 )
 
 segments = Table(
@@ -77,4 +80,17 @@ alerts = Table(
     Column("acknowledged_by", String(36)),
     Index("ix_alerts_occurred_at", "occurred_at"),
     Index("ix_alerts_camera", "camera_id", "occurred_at"),
+)
+
+recorder_workers = Table(
+    "recorder_workers", metadata,
+    Column("id", String(64), primary_key=True),
+    Column("mode", String(20), nullable=False, default="single"),
+    Column("shard_index", Integer, nullable=False, default=0),
+    Column("shard_total", Integer, nullable=False, default=1),
+    Column("max_recorders", Integer, nullable=False, default=16),
+    Column("active_recorders", Integer, nullable=False, default=0),
+    Column("status", String(20), nullable=False, default="running"),
+    Column("started_at", Float, nullable=False),
+    Column("last_heartbeat_at", Float, nullable=False),
 )

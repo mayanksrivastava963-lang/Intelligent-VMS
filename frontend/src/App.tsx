@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 import type Hls from "hls.js";
-import { api, uploadVideo } from "./api";
+import { api } from "./api";
 import CommandPalette, { buildCommandItems } from "./components/CommandPalette";
 import Icon from "./components/Icon";
 import LoginPage from "./components/LoginPage";
@@ -68,26 +68,19 @@ function CameraFeed({
   alertCount: number;
   streamingMode: "mediamtx" | "mjpeg";
 }) {
-  const [segmentIndex, setSegmentIndex] = useState(0);
-  const [playbackCycle, setPlaybackCycle] = useState(0);
-  const [loop, setLoop] = useState(true);
   const video = useRef<HTMLVideoElement>(null);
   const streamImage = useRef<HTMLImageElement>(null);
   const screen = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [streamError, setStreamError] = useState(false);
   const [streamRetry, setStreamRetry] = useState(0);
-  const [playbackState, setPlaybackState] = useState<"loading" | "playing" | "paused">("loading");
   const [aiResult, setAiResult] = useState<DetectionResult | null>(null);
   const [aiError, setAiError] = useState("");
-  const currentSegment = camera.segments[segmentIndex];
   const feedState = camera.status === "stopped" ? "stopped"
-    : camera.source_type === "rtsp" ? (streamError ? "error" : camera.connection_status ?? "connecting")
-    : playbackState;
+    : (streamError ? "error" : camera.connection_status ?? "connecting");
 
   useEffect(() => {
     setStreamError(false);
-    setPlaybackState("loading");
     setAiResult(null);
   }, [camera.id, camera.status, camera.playback_revision]);
 
@@ -157,45 +150,19 @@ function CameraFeed({
           if (!cancelled && result.processed_at > 0 && Date.now() / 1000 - result.processed_at < 10) {
             setAiResult(result);
             setAiError("");
+          } else if (!cancelled) {
+            setAiResult(null);
+            setAiError("AI results unavailable or stale");
           }
         } catch {
-          if (!cancelled) setAiError("AI unavailable");
+          if (!cancelled) { setAiResult(null); setAiError("AI unavailable"); }
         } finally {
           busy = false;
         }
         return;
       }
-      if (camera.source_type === "virtual" && video.current?.paused) return;
-      const source = camera.source_type === "rtsp" ? streamImage.current : video.current;
-      const width = source instanceof HTMLVideoElement ? source.videoWidth : source?.naturalWidth ?? 0;
-      const height = source instanceof HTMLVideoElement ? source.videoHeight : source?.naturalHeight ?? 0;
-      if (!source || !width || !height) return;
-      busy = true;
-      const capturedAt = Date.now();
-      const videoTime = video.current?.currentTime ?? 0;
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.min(width, 640);
-        canvas.height = Math.round((canvas.width * height) / width);
-        canvas.getContext("2d")?.drawImage(source, 0, 0, canvas.width, canvas.height);
-        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.78));
-        if (!blob || cancelled) return;
-        const result = await api<DetectionResult>(`/cameras/${camera.id}/ai/detections`, {
-          method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob,
-        });
-        if (cancelled || Date.now() - capturedAt > 1500) return;
-        if (camera.source_type === "virtual" && Math.abs((video.current?.currentTime ?? 0) - videoTime) > 0.8) return;
-        setAiResult(result);
-        setAiError("");
-        window.clearTimeout(clearResult);
-        clearResult = window.setTimeout(() => setAiResult(null), 1100);
-      } catch (reason) {
-        const message = reason instanceof Error ? reason.message : "AI unavailable";
-        if (!cancelled && !message.includes("AI processor is busy") && !message.includes("Wait before"))
-          setAiError("AI unavailable");
-      } finally {
-        busy = false;
-      }
+      setAiError("Configure the analytics worker");
+
     }
 
     const initial = window.setTimeout(() => void sampleFrame(), 500);
@@ -207,15 +174,6 @@ function CameraFeed({
       window.clearInterval(timer);
     };
   }, [camera.ai_enabled, camera.connection_status, camera.id, camera.source_type, camera.status, camera.playback_revision, sampleIntervalMs, streamingMode]);
-
-  function playNextSegment() {
-    if (segmentIndex + 1 < camera.segments.length) {
-      setSegmentIndex(segmentIndex + 1);
-    } else if (loop) {
-      setSegmentIndex(0);
-      setPlaybackCycle((current) => current + 1);
-    }
-  }
 
   function captureSnapshot() {
     const el = video.current;
@@ -252,21 +210,6 @@ function CameraFeed({
           <><img ref={streamImage} className="rtsp-stream" src={`/api/cameras/${camera.id}/stream?revision=${camera.playback_revision ?? 0}`} alt={`${camera.name} live feed`} onLoad={() => setStreamError(false)} onError={() => setStreamError(true)} />{feedState !== "online" && <div className="rtsp-connecting">{feedState === "offline" ? "Camera offline · retrying" : "Connecting to camera…"}</div>}</>
         ) : camera.status === "running" && camera.source_type === "rtsp" ? (
           <><video ref={video} className="rtsp-stream" autoPlay muted playsInline onPlaying={() => setStreamError(false)} />{feedState !== "online" && <div className="rtsp-connecting">{feedState === "offline" ? "Camera offline · retrying" : feedState === "reconnecting" ? "Reconnecting to camera…" : feedState === "error" ? "Preview unavailable · retrying" : "Connecting to camera…"}</div>}</>
-        ) : camera.status === "running" && currentSegment ? (
-          <video
-            ref={video}
-            key={`${camera.id}-${camera.playback_revision ?? 0}-${segmentIndex}-${playbackCycle}`}
-            src={currentSegment.playback_url}
-            autoPlay
-            muted
-            controls
-            playsInline
-            onPlaying={() => setPlaybackState("playing")}
-            onWaiting={() => setPlaybackState("loading")}
-            onPause={() => setPlaybackState("paused")}
-            onEnded={playNextSegment}
-            onError={() => onControl("stop")}
-          />
         ) : (
           <div className="camera-placeholder">
             <span className="camera-placeholder-icon">◉</span>
@@ -284,11 +227,11 @@ function CameraFeed({
           })}
         </svg>}
         <span className={`camera-live ${feedState}`}>
-          <i /> {feedState === "online" ? "LIVE" : feedState === "playing" ? "SIMULATED LIVE" : feedState.toUpperCase()}
+          <i /> {feedState === "online" ? "LIVE" : feedState.toUpperCase()}
         </span>
         {camera.status === "running" && (
           <>
-            {camera.source_type === "virtual" && <button
+            {streamingMode === "mediamtx" && <button
               type="button"
               className="snapshot-button"
               title="Capture PNG snapshot"
@@ -302,13 +245,14 @@ function CameraFeed({
             {camera.source_type === "rtsp" && streamingMode === "mediamtx" && <button className="webrtc-button" type="button" title="Open low-latency WebRTC view" onClick={() => window.open(`/live-webrtc/${camera.id}`, "_blank", "noopener,noreferrer")}>WebRTC ↗</button>}
           </>
         )}
-        {camera.ai_enabled && <span className="ai-indicator">{aiError || `AI ON · ${aiResult?.detections.length ?? 0} objects`}</span>}
+        {camera.ai_enabled && <span className="ai-indicator">{aiError || (aiResult ? `AI ON · ${aiResult.detections.length} objects` : "Awaiting AI results")}</span>}
         {alertCount > 0 && <span className="camera-alert-indicator">{alertCount} alert{alertCount === 1 ? "" : "s"} to review</span>}
       </div>
       <div className="camera-card-info">
         <div>
           <strong>{camera.name}</strong>
-          <small>{camera.location || "Location not set"} · {camera.source_type === "rtsp" ? "RTSP camera" : "Virtual camera"}</small>
+          <small>Recording: {camera.recording_status ?? "unknown"}</small>
+          <small>{camera.location || "Location not set"} · {camera.source_type === "rtsp" ? "RTSP camera" : "Camera"}</small>
         </div>
         <span className="camera-id">{camera.id.slice(0, 8).toUpperCase()}</span>
       </div>
@@ -319,8 +263,7 @@ function CameraFeed({
           <button className="secondary" onClick={() => onControl("start")}>Start feed</button>
         ))}
         {canManage && <button className="text-button" onClick={() => onControl("restart")}>Restart</button>}
-        {canManage && <button className="text-button" onClick={onToggleAI}>{camera.ai_enabled ? "Disable AI" : "Enable AI"}</button>}
-        {camera.source_type === "virtual" && <label className="loop-toggle"><input type="checkbox" checked={loop} onChange={(event) => setLoop(event.target.checked)} /> Loop</label>}
+        {canManage && camera.ai_available && <button className="text-button" onClick={onToggleAI}>{camera.ai_enabled ? "Disable AI" : "Enable AI"}</button>}
         {canManage && <button className="remove-camera" onClick={onRemove} title="Remove camera" aria-label={`Remove ${camera.name}`}>×</button>}
       </div>
     </article>
@@ -330,7 +273,7 @@ function CameraFeed({
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [checking, setChecking] = useState(true);
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
@@ -342,12 +285,10 @@ export default function App() {
   const [clock, setClock] = useState(new Date());
   const [cameraSearch, setCameraSearch] = useState("");
   const [cameraFilter, setCameraFilter] = useState("all");
-  const [cameraSourceFilter, setCameraSourceFilter] = useState("all");
   const [cameraLocationFilter, setCameraLocationFilter] = useState("all");
   const [gridColumns, setGridColumns] = useState("auto");
   const [cameraPage, setCameraPage] = useState(0);
   const [camerasPerPage, setCamerasPerPage] = useState<9 | 16>(9);
-  const [cameraDialog, setCameraDialog] = useState(false);
   const [rtspDialog, setRtspDialog] = useState(false);
   const [addCameraDialog, setAddCameraDialog] = useState(false);
   const [rtspUrl, setRtspUrl] = useState("");
@@ -358,13 +299,8 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<RecordingDetail | null>(null);
   const [segment, setSegment] = useState<Segment | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadPercent, setUploadPercent] = useState(0);
-  const [uploadName, setUploadName] = useState("");
-  const [dragging, setDragging] = useState(false);
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
-  const [retrying, setRetrying] = useState(false);
   const [playerError, setPlayerError] = useState("");
   const [userAccounts, setUserAccounts] = useState<UserAccount[]>([]);
   const [accessRoles, setAccessRoles] = useState<AccessRole[]>([]);
@@ -377,17 +313,13 @@ export default function App() {
   const [commandOpen, setCommandOpen] = useState(false);
   const [toasts, setToasts] = useState<Array<{ id: number; text: string }>>([]);
   const [recordingFilter, setRecordingFilter] = useState<"all" | "ready" | "processing" | "failed">("all");
+  const [recordingCameraFilter, setRecordingCameraFilter] = useState("all");
   const [auditFilter, setAuditFilter] = useState<"all" | "success" | "failure">("all");
   const [auditSearch, setAuditSearch] = useState("");
   const [playbackRate, setPlaybackRate] = useState<1 | 1.5 | 2>(1);
   const [autoAdvance, setAutoAdvance] = useState(true);
   const [batchBusy, setBatchBusy] = useState(false);
-  const [virtualVideoId, setVirtualVideoId] = useState("");
-  const input = useRef<HTMLInputElement>(null);
   const detailVideo = useRef<HTMLVideoElement>(null);
-  const uploadRequest = useRef<XMLHttpRequest | null>(null);
-  const uploadQueue = useRef<File[]>([]);
-  const uploadingRef = useRef(false);
 
   function pushToast(text: string) {
     const id = Date.now() + Math.random();
@@ -431,7 +363,7 @@ export default function App() {
 
   useEffect(() => {
     setCameraPage(0);
-  }, [cameraSearch, cameraFilter, cameraSourceFilter, cameraLocationFilter, camerasPerPage]);
+  }, [cameraSearch, cameraFilter, cameraLocationFilter, camerasPerPage]);
 
   useEffect(() => {
     const expired = () => {
@@ -457,9 +389,12 @@ export default function App() {
     let timer: number;
     async function refresh() {
       try {
+        const videoParams = new URLSearchParams({ limit: "50", offset: String(offset) });
+        if (recordingCameraFilter !== "all") videoParams.set("camera_id", recordingCameraFilter);
+        if (search.trim()) videoParams.set("q", search.trim());
         const [items, cameraItems] = await Promise.all([
-          api<Recording[]>(`/videos?limit=50&offset=${offset}`, { signal: controller.signal }),
-          api<Camera[]>("/cameras", { signal: controller.signal }),
+          api<Recording[]>(`/videos?${videoParams.toString()}`, { signal: controller.signal }),
+          api<Camera[]>("/cameras?limit=500", { signal: controller.signal }),
         ]);
         setRecordings(items);
         setCameras(cameraItems);
@@ -486,7 +421,7 @@ export default function App() {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [session, selectedId, offset]);
+  }, [session, selectedId, offset, recordingCameraFilter, search]);
 
   useEffect(() => {
     if (!session?.permissions.includes("alerts.read")) return;
@@ -644,86 +579,11 @@ export default function App() {
     }
   }
 
-  function upload(file: File | undefined) {
-    if (!file || !session) return;
-    if (!/\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(file.name)) {
-      setError("Choose an MP4, MOV, MKV, AVI, WEBM or M4V video.");
-      return;
-    }
-    if (!file.size || file.size > session.max_upload_bytes) {
-      setError(
-        `Choose a nonempty video under ${size(session.max_upload_bytes)}.`,
-      );
-      return;
-    }
-    if (uploadingRef.current) {
-      uploadQueue.current.push(file);
-      return;
-    }
-    setError("");
-    uploadingRef.current = true;
-    setUploading(true);
-    setUploadName(file.name);
-    setUploadPercent(0);
-    uploadRequest.current = uploadVideo(
-      file,
-      setUploadPercent,
-      (recording, message) => {
-        uploadingRef.current = false;
-        setUploading(false);
-        uploadRequest.current = null;
-        if (message) setError(message);
-        if (recording) {
-          setOffset(0);
-          setSelectedId(recording.id);
-          setDetail(null);
-          setSegment(null);
-          setRecordings((current) => [
-            recording,
-            ...current.filter((item) => item.id !== recording.id),
-          ]);
-        }
-        if (input.current) input.current.value = "";
-        const nextFile = uploadQueue.current.shift();
-        if (nextFile) window.setTimeout(() => upload(nextFile), 0);
-      },
-    );
-  }
-
   function selectRecording(recording: Recording) {
     setSelectedId(recording.id);
     setDetail(null);
     setSegment(null);
     setPlayerError("");
-  }
-
-  async function createVirtualCamera() {
-    const targetVideoId = virtualVideoId || detail?.id;
-    if (!targetVideoId || !cameraName.trim()) return;
-    setCameraSaving(true);
-    setError("");
-    try {
-      const camera = await api<Camera>("/cameras", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          video_id: targetVideoId,
-          name: cameraName.trim(),
-          location: cameraLocation.trim(),
-        }),
-      });
-      setCameras((current) => [...current, camera]);
-      setCameraDialog(false);
-      setVirtualVideoId("");
-      setCameraName("");
-      setCameraLocation("");
-      setActivePage("cameras");
-      pushToast(`Added camera "${camera.name}"`);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Camera creation failed");
-    } finally {
-      setCameraSaving(false);
-    }
   }
 
   async function createRtspCamera() {
@@ -807,29 +667,28 @@ export default function App() {
     }
   }
 
+  async function toggleRecordingProtection(target: RecordingDetail) {
+    const next = !target.protected;
+    try {
+      const result = await api<{ id: string; protected: boolean }>(`/videos/${target.id}/protection`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ protected: next }),
+      });
+      setDetail((current) => current && current.id === target.id ? { ...current, protected: result.protected } : current);
+      setRecordings((current) => current.map((item) => item.id === target.id ? { ...item, protected: result.protected } : item));
+      pushToast(result.protected ? "Recording protected from auto-retention" : "Recording protection removed");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not update recording protection");
+    }
+  }
+
   async function removeCamera(cameraId: string) {
     try {
       await api(`/cameras/${cameraId}`, { method: "DELETE" });
       setCameras((current) => current.filter((item) => item.id !== cameraId));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Camera removal failed");
-    }
-  }
-
-  async function retry() {
-    if (!detail) return;
-    setRetrying(true);
-    setError("");
-    try {
-      setDetail(
-        await api<RecordingDetail>(`/videos/${detail.id}/retry`, {
-          method: "POST",
-        }),
-      );
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Retry failed");
-    } finally {
-      setRetrying(false);
     }
   }
 
@@ -893,11 +752,9 @@ export default function App() {
     roles: "Roles & permissions",
     audit: "Security audit log",
   }[activePage];
-  const readyRecordings = recordings.filter((item) => item.status === "ready");
   const visibleCameras = cameras.filter((camera) =>
     `${camera.name} ${camera.location} ${camera.id}`.toLowerCase().includes(cameraSearch.toLowerCase()) &&
     (cameraFilter === "all" || camera.status === cameraFilter) &&
-    (cameraSourceFilter === "all" || camera.source_type === cameraSourceFilter) &&
     (cameraLocationFilter === "all" || camera.location === cameraLocationFilter),
   );
   const totalCameraPages = Math.max(1, Math.ceil(visibleCameras.length / camerasPerPage));
@@ -917,7 +774,6 @@ export default function App() {
     pages: permittedNavigation,
     cameras,
     recordings,
-    canUpload: session.permissions.includes("recording.manage") && !uploading,
     onNavigate: (pageId) => setActivePage(pageId as typeof activePage),
     onSelectCamera: (camera) => {
       setCameraSearch(camera.name);
@@ -928,7 +784,6 @@ export default function App() {
       setActivePage("recordings");
       selectRecording(recording);
     },
-    onUpload: () => input.current?.click(),
     onLogout: () => void logout(),
   });
 
@@ -951,7 +806,6 @@ export default function App() {
           </div>
           <button
             onClick={logout}
-            disabled={uploading}
             title="Sign out"
             aria-label="Sign out"
           >
@@ -960,17 +814,9 @@ export default function App() {
         </div>
       </aside>
       <main className="main">
-        <input ref={input} type="file" accept=".mp4,.mov,.mkv,.avi,.webm,.m4v" multiple hidden aria-label="Choose video" onChange={(event) => {
-          const files = Array.from(event.target.files ?? []);
-          if (files.length) {
-            setActivePage("recordings");
-            files.forEach(upload);
-          }
-          event.target.value = "";
-        }} />
         <header>
           <span>
-            Intelligent VMS <span className="slash">/</span>{" "}
+            Intelligent-VMS <span className="slash">/</span>{" "}
             <strong>{navigation.find((item) => item.id === activePage)?.label}</strong>
           </span>
           <div className="header-tools">
@@ -992,18 +838,11 @@ export default function App() {
           <div>
             <div className="eyebrow">{activePage === "dashboard" ? "HOME" : activePage === "system" ? "SYSTEM HEALTH" : activePage === "cameras" ? "LIVE MONITORING" : activePage === "recordings" ? "VIDEO LIBRARY" : "ADMINISTRATION"}</div>
             <h1>{pageTitle}</h1>
-            <p>{activePage === "dashboard" ? `Welcome back, ${session.full_name}. Everything you need to watch cameras and manage videos.` : activePage === "system" ? "Live CPU, memory, and disk storage on your server." : activePage === "cameras" ? "Watch live cameras, capture snapshots, or add a new feed in seconds." : activePage === "recordings" ? `Upload videos and watch them as ${session.segment_seconds / 60}-minute clips.` : `Manage team access as ${session.role_name}.`}</p>
+            <p>{activePage === "dashboard" ? `Welcome back, ${session.full_name}. Everything you need to watch cameras and manage videos.` : activePage === "system" ? "Live CPU, memory, and disk storage on your server." : activePage === "cameras" ? "Watch live cameras, capture snapshots, or add a new feed in seconds." : activePage === "recordings" ? `Review stored camera footage in ${session.segment_seconds / 60}-minute recording segments.` : `Manage team access as ${session.role_name}.`}</p>
           </div>
           <div className="page-heading-actions">
             {activePage === "users" && session.permissions.includes("user.manage") && <button className="primary" onClick={() => openUserDialog("create")}>＋ Add user</button>}
             {activePage === "cameras" && session.permissions.includes("camera.manage") && <button className="primary" onClick={() => setAddCameraDialog(true)}>＋ Add camera</button>}
-            {(activePage === "dashboard" || activePage === "cameras" || activePage === "recordings") && session.permissions.includes("recording.manage") && <button
-              className={activePage === "cameras" ? "secondary" : "primary"}
-              onClick={() => input.current?.click()}
-              disabled={uploading}
-            >
-              ＋ Upload video
-            </button>}
           </div>
         </div>
         {notice && (
@@ -1037,8 +876,8 @@ export default function App() {
                 {runningCamerasCount > 0
                   ? `${runningCamerasCount} camera feed${runningCamerasCount > 1 ? "s" : ""} requested to run and ${ready} recording${ready === 1 ? "" : "s"} ready for review.`
                   : ready > 0
-                    ? `${ready} processed recording${ready === 1 ? "" : "s"} ready in your library. Launch a virtual camera feed anytime.`
-                    : "Your intelligent surveillance center is online. Upload a video to start streaming and analyzing."}
+                    ? `${ready} processed recording${ready === 1 ? "" : "s"} ready in your library. Select a recording to review footage.`
+                    : "Connect an authorized network camera to begin monitoring."}
               </p>
             </div>
             <div className="hero-boost-actions">
@@ -1056,7 +895,7 @@ export default function App() {
           </section>
           <div className="overview-summary">
             <button className="overview-tile blue" style={{ "--stagger": 0 } as CSSProperties} onClick={() => setActivePage("cameras")}><Icon name="cameras" /><span>Total cameras</span><strong>{cameras.length.toString().padStart(2, "0")}</strong><small>View all cameras <b>↗</b></small></button>
-            <button className="overview-tile mint" style={{ "--stagger": 1 } as CSSProperties} onClick={() => { setCameraFilter("running"); setActivePage("cameras"); }}><Icon name="dashboard" /><span>Live right now</span><strong>{cameras.filter((camera) => camera.status === "running").length.toString().padStart(2, "0")}</strong><small>Open live view <b>↗</b></small></button>
+            <button className="overview-tile mint" style={{ "--stagger": 1 } as CSSProperties} onClick={() => { setCameraFilter("running"); setActivePage("cameras"); }}><Icon name="dashboard" /><span>Requested to run</span><strong>{cameras.filter((camera) => camera.status === "running").length.toString().padStart(2, "0")}</strong><small>Open live view <b>↗</b></small></button>
             <button className="overview-tile violet" style={{ "--stagger": 2 } as CSSProperties} onClick={() => setActivePage("recordings")}><Icon name="recordings" /><span>Saved videos</span><strong>{recordings.length.toString().padStart(2, "0")}</strong><small>{ready} ready to watch <b>↗</b></small></button>
             <button className="overview-tile amber" style={{ "--stagger": 3 } as CSSProperties} onClick={() => setActivePage("recordings")}><Icon name="system" /><span>Processing now</span><strong>{processing.toString().padStart(2, "0")}</strong><small>Preparing playback <b>↗</b></small></button>
           </div>
@@ -1064,26 +903,23 @@ export default function App() {
           <div className="overview-bottom">
             <section className="panel recent-panel"><div className="section-title"><div><h2>Recording library</h2><p>Files on the current library page</p></div><button className="text-button" onClick={() => setActivePage("recordings")}>View library →</button></div>
               {recordings.slice(0, 4).map((recording) => <button className="recent-recording" key={recording.id} onClick={() => { setActivePage("recordings"); void selectRecording(recording); }}><span className="recent-icon"><Icon name="recordings" /></span><span><strong>{recording.filename}</strong><small>{size(recording.bytes)} · {new Date(recording.created_at * 1000).toLocaleDateString()}</small></span><span className={`status ${recording.status}`}>{recording.status}</span></button>)}
-              {!recordings.length && <div className="empty"><Icon name="recordings" /><h3>Your footage belongs here</h3><p>Upload your first video to get started.</p></div>}
+              {!recordings.length && <div className="empty"><Icon name="recordings" /><h3>Your footage belongs here</h3><p>Completed camera recordings will appear here.</p></div>}
             </section>
-            <section className="workflow-card"><span className="eyebrow">START MONITORING</span><h2>From video to virtual camera.</h2><p>Bring your recorded footage into a single monitoring workspace.</p><ol><li><b>01</b><span>Upload your videos<small>MP4, AVI, MOV and more</small></span></li><li><b>02</b><span>Wait for processing<small>Browser-compatible playback</small></span></li><li><b>03</b><span>Add a virtual camera<small>Name it and open Live view</small></span></li></ol><button className="secondary" onClick={() => setActivePage("recordings")}>Open playback library →</button></section>
+<section className="workflow-card"><span className="eyebrow">START MONITORING</span><h2>Connect your cameras.</h2><p>Add an authorized network camera, configure its main stream and optional substream, then start monitoring.</p><p>Recording runs independently of this browser. Verify storage and recording health before relying on coverage.</p><button className="secondary" onClick={() => setActivePage("cameras")}>Open camera management</button></section>
           </div>
         </>}
         {activePage === "system" && session.permissions.includes("health.read") && <SystemMonitor />}
         {activePage === "cameras" && (
           <>
             <section className="stats camera-stats" aria-label="Camera statistics">
-              <div><span>TOTAL CAMERAS</span><strong>{cameras.length.toString().padStart(2, "0")}</strong><small>Connected feeds</small></div>
-              <div><span>LIVE NOW</span><strong>{cameras.filter((camera) => camera.status === "running").length.toString().padStart(2, "0")}</strong><small>Active feeds</small></div>
+              <div><span>TOTAL CAMERAS</span><strong>{cameras.length.toString().padStart(2, "0")}</strong><small>Registered cameras</small></div>
+              <div><span>REQUESTED TO RUN</span><strong>{cameras.filter((camera) => camera.status === "running").length.toString().padStart(2, "0")}</strong><small>Check connection status below</small></div>
               <div><span>STOPPED</span><strong>{cameras.filter((camera) => camera.status === "stopped").length.toString().padStart(2, "0")}</strong><small>Ready to start</small></div>
               <div><span>RTSP ONLINE</span><strong>{cameras.filter((camera) => camera.source_type === "rtsp" && camera.connection_status === "online").length.toString().padStart(2, "0")}</strong><small>Streaming live</small></div>
             </section>
             {session.permissions.includes("alerts.read") && alerts.some((alert) => !alert.acknowledged_at) && <section className="camera-alert-list" aria-label="AI alerts"><strong>AI alerts for review</strong>{alerts.filter((alert) => !alert.acknowledged_at).slice(0, 5).map((alert) => <div key={alert.id}><span>{alert.message} · {new Date(alert.occurred_at * 1000).toLocaleTimeString()}</span>{session.permissions.includes("alerts.manage") && <button className="secondary" onClick={() => void acknowledgeAlert(alert.id)}>Acknowledge</button>}</div>)}</section>}
             <div className="camera-toolbar">
               <input type="search" placeholder="Search camera or location…" aria-label="Search cameras" value={cameraSearch} onChange={(event) => setCameraSearch(event.target.value)} />
-              <select className="camera-filter-select" aria-label="Filter by camera source" value={cameraSourceFilter} onChange={(event) => setCameraSourceFilter(event.target.value)}>
-                <option value="all">All types</option><option value="virtual">Uploaded video</option><option value="rtsp">RTSP camera</option>
-              </select>
               {cameraLocations.length > 0 && (
                 <select className="camera-filter-select" aria-label="Filter by location" value={cameraLocationFilter} onChange={(event) => setCameraLocationFilter(event.target.value)}>
                   <option value="all">All locations</option>{cameraLocations.map((location) => <option key={location} value={location}>{location}</option>)}
@@ -1098,7 +934,7 @@ export default function App() {
                       className={`pill-btn ${cameraFilter === status ? "active" : ""}`}
                       onClick={() => setCameraFilter(status)}
                     >
-                      {status === "all" ? `All (${cameras.length})` : status === "running" ? `Live (${runningCamerasCount})` : `Stopped (${cameras.length - runningCamerasCount})`}
+                      {status === "all" ? `All (${cameras.length})` : status === "running" ? `Running (${runningCamerasCount})` : `Stopped (${cameras.length - runningCamerasCount})`}
                     </button>
                   ))}
                 </div>
@@ -1126,8 +962,8 @@ export default function App() {
               {pagedCameras.map((camera, index) => (
                 <CameraFeed key={camera.id + (camera.playback_revision ?? "")} camera={camera} index={index} canManage={session.permissions.includes("camera.manage")} sampleIntervalMs={session.ai_sample_interval_ms} streamingMode={session.streaming_mode} alertCount={alerts.filter((alert) => alert.camera_id === camera.id && !alert.acknowledged_at).length} onControl={(action) => void controlCamera(camera.id, action)} onToggleAI={() => void toggleCameraAI(camera)} onSnapshot={pushToast} onRemove={() => { if (window.confirm(`Remove ${camera.name} from the dashboard?`)) void removeCamera(camera.id); }} />
               ))}
-              {!cameras.length && <div className="camera-empty"><span>◉</span><h2>No cameras yet</h2><p>Add a live RTSP camera or turn an uploaded video into a camera in one click.</p>{session.permissions.includes("camera.manage") && <button className="primary" onClick={() => setAddCameraDialog(true)}>＋ Add your first camera</button>}</div>}
-              {!!cameras.length && !visibleCameras.length && <div className="camera-empty"><h2>No matching cameras</h2><p>Try another name, location or filter.</p><button className="secondary" onClick={() => { setCameraSearch(""); setCameraFilter("all"); setCameraSourceFilter("all"); setCameraLocationFilter("all"); }}>Reset filters</button></div>}
+              {!cameras.length && <div className="camera-empty"><span>◉</span><h2>No cameras yet</h2><p>Connect an authorized IP camera to begin monitoring.</p>{session.permissions.includes("camera.manage") && <button className="primary" onClick={() => setAddCameraDialog(true)}>＋ Add your first camera</button>}</div>}
+              {!!cameras.length && !visibleCameras.length && <div className="camera-empty"><h2>No matching cameras</h2><p>Try another name, location or filter.</p><button className="secondary" onClick={() => { setCameraSearch(""); setCameraFilter("all"); setCameraLocationFilter("all"); }}>Reset filters</button></div>}
             </section>
             {visibleCameras.length > 9 && (
               <div className="camera-pagination">
@@ -1166,7 +1002,7 @@ export default function App() {
           <div>
             <span>RECORDINGS ON THIS PAGE</span>
             <strong>{recordings.length.toString().padStart(2, "0")}</strong>
-            <small>Uploaded sources</small>
+            <small>Stored recordings</small>
           </div>
           <div>
             <span>READY TO REVIEW</span>
@@ -1179,63 +1015,12 @@ export default function App() {
           <div>
             <span>IN PROGRESS</span>
             <strong>{processing.toString().padStart(2, "0")}</strong>
-            <small>Uploading, queued or processing</small>
+            <small>Pending processing</small>
           </div>
           <div>
             <span>SOURCE STORAGE · THIS PAGE</span>
             <strong>{size(totalBytes)}</strong>
-            <small>Original upload sizes</small>
-          </div>
-        </section>
-        <section
-          className={`upload-zone ${dragging ? "dragging" : ""}`}
-          onDragOver={(event) => {
-            event.preventDefault();
-            setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={(event) => {
-            event.preventDefault();
-            setDragging(false);
-            Array.from(event.dataTransfer.files).forEach(upload);
-          }}
-        >
-          <div className="upload-icon">↑</div>
-          <div className="upload-copy">
-            <h2>
-              {uploading ? uploadName : "Drop videos here to upload"}
-            </h2>
-            <p>
-              {uploading
-                ? uploadPercent === 100
-                  ? "Upload finished. Preparing video for playback…"
-                  : `Uploading… ${uploadPercent}%`
-                : "Drag and drop a file here, or click Browse files. Videos are automatically split into playable clips."}
-            </p>
-            {uploading && (
-              <progress
-                value={uploadPercent}
-                max={100}
-                aria-label="Upload progress"
-              />
-            )}
-          </div>
-          <button
-            className="secondary"
-            onClick={() => {
-              if (uploading) {
-                uploadQueue.current = [];
-                uploadRequest.current?.abort();
-              } else {
-                input.current?.click();
-              }
-            }}
-          >
-            {uploading ? "Cancel upload" : "Browse files"}
-          </button>
-          <div className="upload-caption">
-            MP4, MOV, MKV, AVI, WEBM, M4V{" "}
-            <span>Up to {size(session.max_upload_bytes)} per file</span>
+            <small>Recorded file sizes</small>
           </div>
         </section>
         <div className="library-layout">
@@ -1246,6 +1031,24 @@ export default function App() {
                 <span className="count">{filtered.length}</span>
               </h2>
               <div className="recordings-tools">
+                {cameras.some((c) => c.source_type === "rtsp") && (
+                  <select
+                    className="camera-filter-select"
+                    aria-label="Filter recordings by camera"
+                    value={recordingCameraFilter}
+                    onChange={(event) => {
+                      setRecordingCameraFilter(event.target.value);
+                      setOffset(0);
+                    }}
+                  >
+                    <option value="all">All cameras</option>
+                    {cameras
+                      .filter((c) => c.source_type === "rtsp")
+                      .map((cam) => (
+                        <option key={cam.id} value={cam.id}>{cam.name}</option>
+                      ))}
+                  </select>
+                )}
                 <div className="pill-group" role="group" aria-label="Filter recordings by status">
                   {(["all", "ready", "processing", "failed"] as const).map((status) => (
                     <button
@@ -1264,7 +1067,10 @@ export default function App() {
                   placeholder="Search this page…"
                   aria-label="Search recordings on current page"
                   value={search}
-                  onChange={(event) => setSearch(event.target.value)}
+                  onChange={(event) => {
+                    setSearch(event.target.value);
+                    setOffset(0);
+                  }}
                 />
               </div>
             </div>
@@ -1338,7 +1144,7 @@ export default function App() {
                 <p>
                   {search
                     ? "Try a different filename."
-                    : "Upload a video to create your first set of recordings."}
+                    : "Start a configured camera and verify that the recording service is running."}
                 </p>
               </div>
             )}
@@ -1375,7 +1181,7 @@ export default function App() {
                 <div className="detail-art">▶</div>
                 <h3>Select a video to watch</h3>
                 <p>
-                  Click any video on the left to play it immediately or turn it into a live camera.
+                  Select a recording on the left to review available segments.
                 </p>
               </div>
             ) : !detail ? (
@@ -1386,20 +1192,17 @@ export default function App() {
                 <div className="detail-metadata">
                   <span>{duration(detail.duration_seconds)}</span>
                   <span>{size(detail.bytes)}</span>
-                  <span className={`status ${detail.status}`}>
-                    {detail.status}
-                  </span>
+                  <span className={`status ${detail.status}`}>{detail.status}</span>
+                  {detail.protected && <span className="status protected">Protected</span>}
+                  {session.permissions.includes("recording.manage") && detail.status === "ready" && (
+                    <button type="button" className="text-button" onClick={() => void toggleRecordingProtection(detail)}>
+                      {detail.protected ? "Unprotect" : "Protect"}
+                    </button>
+                  )}
                 </div>
                 {detail.status === "failed" && (
                   <div className="error">
                     <p>{detail.error}</p>
-                    <button
-                      className="secondary"
-                      onClick={retry}
-                      disabled={retrying}
-                    >
-                      {retrying ? "Retrying…" : "Retry processing"}
-                    </button>
                   </div>
                 )}
                 {["queued", "processing", "uploading"].includes(
@@ -1411,12 +1214,12 @@ export default function App() {
                       {detail.status === "queued"
                         ? "Waiting for recording worker"
                         : detail.status === "uploading"
-                          ? "Receiving upload"
+                          ? "Awaiting processing"
                           : "Creating your segments"}
                     </strong>
                     <progress value={detail.progress} max={100} />
                     <p>
-                      You can leave this page after the upload finishes.
+                      Processing status is shown for retained historical footage.
                       Processing runs independently.
                     </p>
                   </div>
@@ -1484,7 +1287,6 @@ export default function App() {
                 )}
                 {detail.status === "ready" && (
                   <>
-                    <button className="primary add-camera-button" onClick={() => { setVirtualVideoId(detail.id); setCameraName(detail.filename.replace(/\.[^.]+$/, "")); setCameraLocation(""); setCameraDialog(true); }}>＋ Add to Live View</button>
                     <div className="segment-heading">
                       SEGMENTS <span>{detail.segments.length} files</span>
                     </div>
@@ -1521,7 +1323,7 @@ export default function App() {
           </aside>
         </div>
         <footer>
-          <span>Intelligent VMS</span>
+          <span>Intelligent-VMS</span>
           <span>Recordings are stored independently of AI analytics.</span>
         </footer>
           </>
@@ -1637,34 +1439,8 @@ export default function App() {
         {addCameraDialog && <div className="dialog-backdrop" role="presentation" onClick={() => setAddCameraDialog(false)}>
           <section className="camera-dialog add-camera-choice" role="dialog" aria-modal="true" aria-labelledby="add-camera-title" onClick={(event) => event.stopPropagation()}>
             <div className="dialog-header-row"><div className="eyebrow">ADD CAMERA</div><button type="button" className="dialog-close" aria-label="Close dialog" onClick={() => setAddCameraDialog(false)}>×</button></div>
-            <h2 id="add-camera-title">Choose camera source</h2><p>Pick a live network camera or use one of your uploaded videos.</p>
+            <h2 id="add-camera-title">Connect a network camera</h2><p>Connect a compatible camera on your authorized network.</p>
             <button type="button" className="camera-source-choice" onClick={() => { setAddCameraDialog(false); setError(""); setCameraName(""); setCameraLocation(""); setRtspUrl(""); setRtspPreviewUrl(""); setRtspDialog(true); }}><Icon name="cameras" /><span><strong>Live RTSP / IP camera</strong><small>Paste the camera’s rtsp:// stream URL</small></span><b>→</b></button>
-            {session.permissions.includes("recording.read") && (
-              <button
-                type="button"
-                className="camera-source-choice"
-                onClick={() => {
-                  setAddCameraDialog(false);
-                  if (readyRecordings.length > 0) {
-                    const first = readyRecordings[0];
-                    setVirtualVideoId(first.id);
-                    setCameraName(first.filename.replace(/\.[^.]+$/, ""));
-                    setCameraLocation("");
-                    setCameraDialog(true);
-                  } else {
-                    setActivePage("recordings");
-                    pushToast("Upload a video first to turn it into a camera.");
-                  }
-                }}
-              >
-                <Icon name="recordings" />
-                <span>
-                  <strong>Uploaded video{readyRecordings.length ? ` (${readyRecordings.length} ready)` : ""}</strong>
-                  <small>{readyRecordings.length ? "Pick a ready video right here" : "Go to Video Library to upload a video first"}</small>
-                </span>
-                <b>→</b>
-              </button>
-            )}
           </section>
         </div>}
         {rtspDialog && <div className="dialog-backdrop" role="presentation" onClick={() => { setRtspDialog(false); setRtspUrl(""); setRtspPreviewUrl(""); }}>
@@ -1683,46 +1459,6 @@ export default function App() {
             <div className="dialog-actions"><button type="button" className="secondary" onClick={() => { setRtspDialog(false); setRtspUrl(""); setRtspPreviewUrl(""); }}>Cancel</button><button className="primary" disabled={cameraSaving}>{cameraSaving ? "Adding…" : "Add camera"}</button></div>
           </form>
         </div>}
-        {cameraDialog && (virtualVideoId || detail) && (
-          <div className="dialog-backdrop" role="presentation" onClick={() => { setCameraDialog(false); setVirtualVideoId(""); }}>
-            <form className="camera-dialog" onSubmit={(event) => { event.preventDefault(); void createVirtualCamera(); }} onClick={(event) => event.stopPropagation()}>
-              <div className="dialog-header-row">
-                <div className="eyebrow">VIRTUAL CAMERA</div>
-                <button type="button" className="dialog-close" aria-label="Close dialog" onClick={() => { setCameraDialog(false); setVirtualVideoId(""); }}>×</button>
-              </div>
-              <h2>Camera details</h2>
-              {readyRecordings.length > 0 ? (
-                <>
-                  <label htmlFor="virtual-video-select">Source video</label>
-                  <select
-                    id="virtual-video-select"
-                    className="camera-filter-select"
-                    value={virtualVideoId || detail?.id || ""}
-                    onChange={(event) => {
-                      const nextId = event.target.value;
-                      setVirtualVideoId(nextId);
-                      const picked = readyRecordings.find((r) => r.id === nextId);
-                      if (picked && !cameraName.trim()) {
-                        setCameraName(picked.filename.replace(/\.[^.]+$/, ""));
-                      }
-                    }}
-                  >
-                    {readyRecordings.map((item) => (
-                      <option key={item.id} value={item.id}>{item.filename}</option>
-                    ))}
-                  </select>
-                </>
-              ) : (
-                <p>Using video: <strong>{detail?.filename}</strong></p>
-              )}
-              <label htmlFor="camera-name">Camera name</label>
-              <input id="camera-name" value={cameraName} onChange={(event) => setCameraName(event.target.value)} maxLength={120} required autoFocus />
-              <label htmlFor="camera-location">Location (optional)</label>
-              <input id="camera-location" value={cameraLocation} onChange={(event) => setCameraLocation(event.target.value)} maxLength={200} placeholder="e.g. Main entrance" />
-              <div className="dialog-actions"><button type="button" className="secondary" onClick={() => { setCameraDialog(false); setVirtualVideoId(""); }}>Cancel</button><button className="primary" disabled={cameraSaving}>{cameraSaving ? "Adding…" : "Add camera"}</button></div>
-            </form>
-          </div>
-        )}
         <CommandPalette
           open={commandOpen}
           onClose={() => setCommandOpen(false)}

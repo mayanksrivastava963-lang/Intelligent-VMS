@@ -1,78 +1,60 @@
-# Intelligent-VMS Project Status
+# Intelligent-VMS Project Status — 0.1.0-rc3 (2026-11-27)
 
-Last updated: 2026-11-26
-Current branch: `feature/ai-engine`
+## Portable Docker Package Created (2026-11-27; latest)
 
-## Implemented
+- Created `releases/Intelligent-VMS-0.1.0-rc3-portable.tar`: 550,119,424 bytes (524.63 MiB), SHA-256 `a672f7c6089b19c64dc52d753ae7eaf689852ade6b25710f3ddf373bf41f5134`. Adjacent `.sha256` and internal `SHA256SUMS` supplied. Package is an internal candidate, NOT approved for commercial redistribution.
+- Five prebuilt linux/amd64 images exported without rebuilding: inspected API/web RC3 images plus PostgreSQL 18.7, Redis 7.4.12 and MediaMTX 1.21.4. API reports RC3 build 6771950; 51 non-test backend, recorder and frontend files matched running containers. Exact IDs recorded in images.json. GPU image excluded because inference is unvalidated.
+- Included production Compose with build sections removed, bundled PostgreSQL 18 volume mount corrected to `/var/lib/postgresql`, runtime media configuration, secure environment template, hidden administrator configuration, fresh optional localhost TLS generation, import/start/stop/status scripts, and separate private backup/restore tooling. No personal environment, recording volume, database dump or TLS private key included. Text files scanned against existing long secret values without printing them.
+- Added reusable `scripts/package-portable.ps1`, `scripts/finalize-portable.ps1`, and templates in `deployment/portable/`. Runtime dependencies need no recipient host Python/Node/PostgreSQL installation; Docker/Compose are prerequisites. Included license materials and installation/hardware/approval documentation.
+- Passed: Compose resolution (8 services, all 5 images present, no builds/AI), PowerShell parse, archive listing (65 entries), all file SHA-256 checksums. Existing database was queried read-only to verify restore emptiness-check quoting. No private backup or restore was executed.
+- Clean-environment load/install and isolated backup/restore round trip remain UNEXECUTED: host RAM reached 86.8%, exceeding the unchanged 85% guard. No new stack/import was forced. Commercial licensing, corresponding-source compliance, security scans and production validation remain release blockers.
 
-- Argon2id account authentication, revocable HttpOnly `SameSite=strict`
-  sessions, `X-VMS-Request: 1` write protection, role permissions, and audit
-  logs remain in place. RTSP main/substream URLs are Fernet-encrypted in the
-  database and excluded from camera API responses and errors.
-- Video upload, background AVI/MP4 conversion, virtual cameras, browser
-  playback, recording search and independent virtual camera controls remain.
-  Prior local testing included the supplied AVI and synthetic MP4/AVI footage.
-- RTSP cameras can be added from the UI with optional low-bandwidth substream.
-  In the Docker stack, MediaMTX provisions each running path once and serves
-  LL-HLS and WebRTC through session-protected Nginx routes. The camera grid
-  renders at most 9 or 16 media players per page. Fullscreen selects the main
-  stream. A one-worker local MJPEG fallback remains for development.
-- Camera listing batches segment lookup into two queries instead of one per
-  camera. `/api/cameras` and `/api/videos` accept limit/offset. Camera status
-  reads use one MediaMTX path-list request per page.
-- PostgreSQL pool size, overflow and recycle settings are explicit. Alembic
-  baselines the recording/auth schema and migrates RTSP health, encrypted
-  substream and alert columns/tables. Login rate limiting uses Redis when
-  configured and a locked local fallback for isolated tests.
-- A separate FFmpeg RTSP recorder stream-copies each running camera into MP4
-  segments and publishes completed segments to the existing playback library.
-  A separate retention service prunes completed RTSP files by age and disk
-  free-space policy while skipping active recording runs.
-- A separate optional GPU AI worker samples enabled cameras, keeps one pending
-  frame per camera, performs bounded batched SSDLite inference, tracks objects
-  per camera and saves intrusion, loitering and unattended-object alerts for
-  review. The UI shows overlays and alerts; `alerts.read` and `alerts.manage`
-  gate the alert APIs.
-- Nginx and Docker Compose configurations, a CUDA AI worker image, and a
-  synthetic 60-camera benchmark script are present.
+## RC3 Deployed and Login Verified (2026-11-27)
 
-## Validation observed this pass
+- Follow-up in the user's actual shared browser tab: navigation initially failed with `ERR_CERT_AUTHORITY_INVALID` for the local self-signed HTTPS certificate. A temporary browser debugging certificate exception allowed the site to load; no Windows certificate trust settings were changed. Signed in successfully as `validation-admin` with the requested recovered password and left the tab on Overview. All seven navigation screens loaded without UI alerts; historical recording playback reached `readyState=4`, duration 23.8 seconds, with no media error. The certificate exception is temporary, not a permanent trust installation. Latest host snapshot: 81.8% RAM used / 2.87 GiB free; no GPU or new recording workload was started.
+- After the user quit Opera, host RAM fell to 61.3% used / 6.13 GiB free. The supported `./scripts/start.ps1 -Validation -Profile development -Build` workflow passed its unchanged 85% startup guard and 6 GiB build headroom check. Both RC3 API and web images built, Compose completed, and `/api/version` returned `0.1.0-rc3` (build `6771950`); `/api/health` returned `ok`.
+- Administrator login returned HTTP 200 through the deployed API with the recovered validation password. A separate headless Microsoft Edge browser loaded the real HTTPS frontend, signed in as `validation-admin`, received an authenticated session, and rendered the administrator dashboard. The password was constructed in memory for verification and was not printed or saved in scripts. The local self-signed certificate required the browser test context to ignore certificate errors.
+- Browser checks loaded Overview, Live View, Playback Library, System Health, Users, Roles & Permissions, and Audit Logs without UI alerts. Four stored RTSP cameras are stopped with AI disabled; four historical recordings are ready. An existing recording loaded in the browser video element (`readyState=4`) and its MP4 segment returned HTTP 206 to a byte-range request. Protect and Unprotect worked in the UI; the original unprotected state was restored.
+- PostgreSQL migration is at `0006_retention_workers (head)`. API, nginx, recorder, retention, Redis, and validation database were healthy at last check. Recorder and retention heartbeats were fresh; a separate retention `--dry-run --once` completed successfully. The eight idle validation containers used about 248 MiB combined. Running application version is RC3; the optional GPU AI worker remains off and inference is unverified.
+- RAM rose to about 82.3% used / 2.80 GiB free after the build and startup; the final idle snapshot was 81.2% used / 2.97 GiB free. `VmmemWSL` used about 3.74 GiB working set; Linux reported 3.1 GiB in buffer/cache. No system-wide configuration was changed. With only a few percentage points to the 85% guard, no new camera or GPU AI workload was started. Continuous live recording, 1800-second rotation, camera management mutations, and GPU inference still require a safe validation window.
 
-- Backend and AI pytest suite: **77 passed** in the final regression run.
-  Focused recorder, retention, MediaMTX provisioning, query-count and Alembic
-  tests passed with synthetic fixtures.
-- TypeScript `tsc --noEmit` and Vite production build passed after the final
-  changes. `hls.js` loads in a separate chunk; Vite reports its size warning.
-- Combined Compose files with `ai` and `production` profiles passed
-  `docker compose config --quiet` using placeholder environment values.
-- Existing PostgreSQL and supplied AVI playback had passed in a prior local
-  phase. This scaling pass used temporary SQLite databases and synthetic media;
-  it did not modify the existing company PostgreSQL database or footage.
+## Earlier Administrator Login Follow-up (2026-11-27; superseded by deployed verification above)
 
-## Unverified and remaining work
+- The local validation `validation-admin` password was reset through the offline recovery utility using the user's requested value. The utility confirmed the real validation PostgreSQL database, updated the Argon2 hash, revoked existing sessions, and recorded an audit event. A fresh verification against the stored hash returned `Password valid: True`. The password is not stored in this status file or deployment configuration. The short-password override is restricted to the validation database and validation administrator; the normal 12-character recovery policy remains in force elsewhere.
+- The login failure's confirmed cause remains the mismatch between the existing account's stored Argon2 hash and the configured bootstrap password. Bootstrap does not replace passwords for existing accounts. API and browser authentication are still pending because the application containers are offline.
+- Safe RC3 build admission stopped before building at 3.68 GiB free RAM, below the configured 6 GiB build headroom. Host RAM at the latest measurement was 77.8% used with 3.51 GiB free (fluctuating between 3.5 and 4.4 GiB free during this follow-up). Major working sets: VS Code 3.36 GiB, Opera 2.61 GiB, VmmemWSL 1.39 GiB. Closure of a user browser is awaiting explicit permission. Validation PostgreSQL is the only persistent running container and uses about 40 MiB. No recordings, database volumes, or configuration were deleted.
+- Recovery-focused tests passed (4/4). Current Docker application version, browser features, and GPU inference remain unverified until a safe deployment is possible.
+- The frontend login form had a misleading hardcoded `admin` username although the validation account is `validation-admin`; the default username is now blank. Frontend TypeScript and production bundle build passed after this change. The React hook imports were already present; an initial duplicate during editing was removed before the passing build.
 
-- Docker Desktop's Linux engine was unavailable on this development machine.
-  MediaMTX config validation, Nginx TLS access, container image builds,
-  actual FFmpeg/MediaMTX transport, continuous recorder operation, GPU worker
-  execution and 60-camera streaming could not be run here.
-- **No measured 60-camera CPU, RAM, VRAM, FPS, disk throughput or API-latency
-  numbers are available.** The benchmark script is ready for a high-resource
-  server but has not been executed. Query-count tests do not establish 60-feed
-  capacity.
-- Physical CCTV and ONVIF hardware testing remain pending. Simulated RTSP is
-  not equivalent to physical camera validation.
-- The AI worker defaults to at most four enabled RTSP cameras. Raising
-  `AI_MAX_CAMERAS` to 60 needs server-side GPU/CPU/VRAM measurements. Intrusion
-  zones require configuration. Current unattended-object logic is an advisory
-  tracker rule, not a validated safety decision.
-- FFmpeg stream-copy to MP4 depends on camera codecs and keyframes. Test each
-  camera model; incompatible codecs may require transcoding. Long-term
-  recorder continuity, retention under disk pressure, HA/failover and disaster
-  recovery are not yet validated.
-- Run a security/access test against real Nginx and MediaMTX before making
-  the service reachable to operators. Supply trusted TLS certificates and set
-  `VMS_SECURE_COOKIE=true`. Pin and validate container image versions for the
-  production server after the Docker engine is available.
+## Earlier Follow-up (2026-11-27; superseded where noted above)
 
-See [60-camera deployment and benchmark guide](docs/scaling-60-cameras.md)
-for commands, assumptions, configuration and validation steps.
+- **Login cause identified before recovery:** The preserved `intelligent-vms-api:0.1.0` image connects to validation PostgreSQL database `intelligent_vms_validation_20261126`. Its own Argon2 verifier returned `False` for the configured bootstrap password against the active `validation-admin` super-administrator hash. Username normalization and the browser JSON login payload match the backend. Bootstrap creates an account only when the users table is empty; changing `validation.env` does not update an existing password. The prior manual reset was unconfirmed; the validated reset is documented above. `scripts/recover-admin.ps1` provides hidden interactive password reset, session revocation, audit entry, `-Check`, and private `-Verify`. API/browser login has **not** been verified yet.
+- **Secrets rotated safely:** `scripts/rotate-validation-secrets.ps1` rotated the validation PostgreSQL password, operator bootstrap password, session secret, and both MediaMTX passwords. Four stored RTSP camera sources were re-encrypted transactionally. A new database connection and decryption of all four sources passed; existing sessions were revoked. The new bootstrap environment password is intentionally not the administrator's chosen login password.
+- **RC3 startup bugs fixed in source:** Compose no longer passes an empty `VMS_MAX_ADMITTED_CAMERAS` value; config also treats empty as unset. Migration 0006 revision ID now fits PostgreSQL's 32-character Alembic version column. The old image failed initialization first on the empty integer and then on the overlong revision; the database migration rolled back. The RC3 image has not been built or migrated yet.
+- **Build safety blocker:** Baseline host RAM was reported at 96.5% used / 0.55 GB free. This session measured 70.8% used / 4.62 GiB free before build, but the guarded `./scripts/start.ps1 -Validation -Profile development -Build` attempt rose to 92.4% used / 1.21 GiB free and was interrupted. The old API image remained intact; recording and database volumes were not deleted. No RC3 container is running. `start.ps1` now requires configurable 6 GiB free for an image build in addition to its unchanged 85% host RAM/CPU guard; this preflight rejected a repeat attempt at 3.45 GiB free before any Docker build began. This build headroom does not affect runtime camera capacity.
+- **Resource attribution:** At high idle pressure, VS Code used ~3.3–3.6 GB, Brave ~2.8–3.1 GB, VmmemWSL ~2.1–2.9 GB, and Docker Desktop/backend ~0.6 GB working set. The four idle validation containers together used ~62 MiB (PostgreSQL ~29, MediaMTX ~12, Redis ~9, synthetic source ~12); no FastAPI, recorder, FFmpeg or AI worker was running. Brave later disappeared without being closed by this agent. Unneeded MediaMTX, Redis and synthetic source containers were stopped. A graceful PostgreSQL/WSL restart reclaimed build cache RAM, then PostgreSQL was restarted and rechecked with all four camera sources; host RAM temporarily measured 71.6% used / 4.49 GiB free and later fluctuated higher. No system-wide WSL configuration was changed. This still leaves less headroom than the observed build peak requires.
+- **Verification:** New targeted tests passed (3/3); full backend and AI suite passed (127/127 in 103.46 s). Validation PostgreSQL connection and four encrypted camera sources passed post-rotation and WSL-restart checks. Final snapshot: host RAM 72.2% used / 4.40 GiB free; only validation PostgreSQL is running and healthy (~42 MiB). RC3 API version, browser features, live recording/retention and GPU inference remain unverified because deployment is blocked. The GPU AI worker remains off.
+
+**Classification: Internal release candidate (`0.1.0-rc3`); customer rollout remains blocked pending production-server qualification and commercial licensing sign-off.**
+
+## What Changed in `0.1.0-rc3`
+
+- **Deployed version & build verification:** Added `/api/version` (reading `VMS_BUILD_VERSION`, `VMS_BUILD_SHA`, `VMS_BUILD_TIMESTAMP`) and build metadata args in `backend/Dockerfile` and `scripts/start.ps1`.
+- **Automatic retention enabled in production Compose:** Wired `storage-retention` into `compose.production.yml`, fixed heartbeat keepalive inside the wait loop, added `protected` legal-hold column (Alembic migration `0006_retention_protection_and_workers`), added `PUT /api/videos/{id}/protection` + UI Protect/Unprotect controls, DB `audit_logs` cleanup/low-disk events, `--dry-run`, `--once`, and unlink-first failure recovery.
+- **Optional production AI worker (`--profile ai`):** Wired `ai-worker` into `compose.production.yml` (CPU default) plus `compose.ai-gpu.yml` (CUDA `cu128` + NVIDIA GPU reservation + `AI_GPU_MEMORY_FRACTION`), `/tmp/vms-ai-worker.heartbeat`, and live Redis heartbeat availability reporting (`vms:ai:worker:heartbeat`). AI remains strictly optional and independent of continuous RTSP recording.
+- **Enterprise multi-worker recording option:** Added `VMS_RECORDER_MODE=distributed` (`compose.distributed-recorders.yml`), per-camera PostgreSQL advisory locks (`pg_try_advisory_lock(18670872, objid)`), deterministic shard affinity, `recorder_workers` heartbeat table, and stale-worker takeover (`RECORDER_TAKEOVER_SECONDS`), while preserving `single` mode global lock (`1867087101`).
+- **Bundled PostgreSQL & Valkey licensing options:** Added `compose.bundled-db.yml` (`setup.ps1 -BundledDb`, `start.ps1 -BundledDb`) alongside external PostgreSQL support, plus `compose.valkey.yml` (BSD-3-Clause Valkey 8 drop-in alternative to Redis 7.4).
+- **Frontend & proxy cleanup:** Configured Vite alias to `hls.js/dist/hls.light.mjs` (chunk reduced from 578 KB to ~362 KB, zero build warnings) and removed obsolete unbuffered `/api/videos` upload proxy settings from `infrastructure/nginx/production.conf.template`.
+- **Security hardening:** Added `-rtsp_flags filter_src` on both FFmpeg RTSP recording and PyAV AI sampling; documented RTSP redirect/SSRF and firewall controls.
+- **Validation & operations tooling:** Added authenticated `scripts/rotation_test.py`, progressive `scripts/progressive_load_test.py` (`4->8->16->32->48->60+` tiers & soak runner), `scripts/backup_restore.ps1`, `docs/BACKUP_RESTORE.md`, and `docs/HARDWARE_SIZING_GUIDE.md`.
+
+## Development Laptop vs Production Server Status
+
+- **Current validation deployment on laptop:** RC3 is running and `/api/version` returns `0.1.0-rc3`; API health and administrator API/browser login passed. The earlier stopped deployment and failed build admission were superseded by the successful guarded build documented above. The 85% startup safety guard remains enabled.
+- **Not yet verified (blocked on dedicated production server & hardware):**
+  - Progressive load tiers beyond 4 synthetic streams (`8/16/32/48/60+` cameras)
+  - Actual 30-minute (`1800s`) live RTSP segment rotation execution
+  - 2h / 8h / 24h / 72h continuous soak tests and multi-worker distributed failover under live load
+  - Physical CCTV camera / ONVIF / codec / browser matrix validation
+  - Clean-machine customer installer dry run & DB backup/restore failover drill
+  - Commercial legal approval for Redis/Valkey, Debian GPL FFmpeg/x264/x265, Torchvision SSDLite weights, and Docker Desktop licensing

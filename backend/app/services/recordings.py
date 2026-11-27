@@ -6,9 +6,16 @@ from sqlalchemy import delete, func, select, update
 from backend.app.models.recordings import cameras, segments, videos
 
 
-def list_videos(engine, limit=100, offset=0):
+def list_videos(engine, limit=100, offset=0, camera_id=None, query_text=None):
     with engine.connect() as connection:
-        rows = connection.execute(select(videos).order_by(videos.c.created_at.desc()).limit(limit).offset(offset))
+        query = select(videos)
+        if camera_id:
+            query = query.where(videos.c.camera_id == camera_id)
+        if query_text:
+            query = query.where(videos.c.filename.ilike(f"%{query_text.strip()}%"))
+        rows = connection.execute(
+            query.order_by(videos.c.created_at.desc()).limit(limit).offset(offset)
+        )
         return [public_video(dict(row)) for row in rows.mappings()]
 
 
@@ -171,4 +178,12 @@ def set_camera_status(engine, camera_id, status):
 def delete_camera(engine, camera_id):
     with engine.begin() as connection:
         result = connection.execute(delete(cameras).where(cameras.c.id == camera_id))
+        return result.rowcount == 1
+
+
+def set_video_protection(engine, video_id, protected):
+    with engine.begin() as connection:
+        result = connection.execute(
+            update(videos).where(videos.c.id == video_id).values(protected=bool(protected))
+        )
         return result.rowcount == 1

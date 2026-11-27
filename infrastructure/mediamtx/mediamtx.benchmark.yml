@@ -1,0 +1,36 @@
+logLevel: warn
+rtsp: true
+rtspTransports: [tcp]
+rtmp: false
+srt: false
+api: true
+apiAddress: :9997
+metrics: true
+metricsAddress: :9998
+hls: true
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+webrtc: true
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+authMethod: internal
+authInternalUsers:
+  - user: vms-api
+    pass: replace-via-MTX_AUTHINTERNALUSERS_0_PASS
+    ips: []
+    permissions:
+      - action: api
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+      - action: playback
+      - action: publish
+        path: "~^benchmark-[0-9]+$"
+paths:
+  "~^benchmark-[0-9]+$":
+    source: publisher

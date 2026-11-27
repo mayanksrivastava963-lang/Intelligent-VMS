@@ -1,0 +1,84 @@
+resolver 127.0.0.11 valid=10s ipv6=off;
+upstream vms_api {
+    zone vms_api 64k;
+    server recording-api:8000 resolve;
+}
+upstream vms_hls {
+    zone vms_hls 64k;
+    server mediamtx:8888 resolve;
+}
+upstream vms_webrtc {
+    zone vms_webrtc 64k;
+    server mediamtx:8889 resolve;
+}
+
+server {
+    listen 80;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name _;
+    ssl_certificate /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root /usr/share/nginx/html;
+    index index.html;
+    client_max_body_size 1m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    location = /_stream_auth {
+        internal;
+        proxy_pass http://vms_api/api/stream-access;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location ^~ /live/ {
+        auth_request /_stream_auth;
+        rewrite ^/live/(.*)$ /$1 break;
+        proxy_set_header Authorization "Basic ${VMS_MEDIA_AUTH}";
+        proxy_pass http://vms_hls;
+        proxy_redirect / /live/;
+        proxy_buffering off;
+        proxy_read_timeout 90s;
+    }
+
+    location ^~ /live-webrtc/ {
+        auth_request /_stream_auth;
+        rewrite ^/live-webrtc/(.*)$ /$1 break;
+        proxy_set_header Authorization "Basic ${VMS_MEDIA_AUTH}";
+        proxy_pass http://vms_webrtc;
+        proxy_redirect / /live-webrtc/;
+        proxy_buffering off;
+        proxy_read_timeout 90s;
+    }
+
+    location /api/ {
+        proxy_pass http://vms_api;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+
+    location / {
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'" always;
+        try_files $uri $uri/ /index.html;
+    }
+}

@@ -1,4 +1,5 @@
 import os
+import ipaddress
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,6 +31,17 @@ def load_settings():
     if not database_url:
         database_url = "sqlite:///" + (ROOT / "storage" / "recordings.db").as_posix()
     settings = {
+        "internal_test_tools": False,
+        "resource_thresholds": tuple(float(os.getenv("VMS_RESOURCE_" + level, default)) for level, default in
+                                     (("WARN", "75"), ("REDUCE", "80"), ("BLOCK", "85"))),
+        "resource_network_interface": os.getenv("VMS_NETWORK_INTERFACE", ""),
+        "resource_hysteresis": float(os.getenv("VMS_RESOURCE_HYSTERESIS", "3")),
+        "resource_network_mbps": float(os.getenv("VMS_NETWORK_MBPS", "0")),
+        "resource_host_file": os.getenv("VMS_HOST_RESOURCE_FILE", ""),
+        "resource_required_metrics": [v.strip() for v in os.getenv("VMS_REQUIRED_METRICS", "").split(",") if v.strip()],
+        "ai_available": os.getenv("VMS_AI_AVAILABLE", "false").lower() == "true",
+        "max_recorders": int(os.getenv("VMS_MAX_RECORDERS", "16")),
+        "camera_networks": [item.strip() for item in os.getenv("VMS_CAMERA_NETWORKS", "").split(",") if item.strip()],
         "storage": storage,
         "database_url": database_url,
         "operator_username": username,
@@ -55,14 +67,36 @@ def load_settings():
         "mediamtx_rtsp_url": os.getenv("MEDIAMTX_RTSP_URL", "rtsp://mediamtx:8554"),
         "retention_days": int(os.getenv("RECORDING_RETENTION_DAYS", "30")),
         "retention_free_high_bytes": int(os.getenv("RETENTION_FREE_HIGH_BYTES", str(11 * 1024**3))),
+        "retention_cycle_seconds": int(os.getenv("RETENTION_CYCLE_SECONDS", "3600")),
+        "recorder_id": os.getenv("VMS_RECORDER_ID", "primary").strip() or "primary",
+        "recorder_mode": os.getenv("VMS_RECORDER_MODE", "single").strip().lower(),
+        "recorder_shard_index": int(os.getenv("RECORDER_SHARD_INDEX", "0")),
+        "recorder_shard_total": int(os.getenv("RECORDER_SHARD_TOTAL", "1")),
+        "recorder_takeover_seconds": int(os.getenv("RECORDER_TAKEOVER_SECONDS", "30")),
+        "max_admitted_cameras": int(os.getenv("VMS_MAX_ADMITTED_CAMERAS") or os.getenv("VMS_MAX_RECORDERS", "16")),
+        "ai_device": os.getenv("AI_DEVICE", "auto").strip().lower(),
+        "ai_gpu_memory_fraction": float(os.getenv("AI_GPU_MEMORY_FRACTION", "0")),
         "ai_batch_size": int(os.getenv("AI_BATCH_SIZE", "4")),
         "ai_max_cameras": int(os.getenv("AI_MAX_CAMERAS", "4")),
+        "ai_shard_index": int(os.getenv("AI_SHARD_INDEX", "0")),
+        "ai_shard_total": int(os.getenv("AI_SHARD_TOTAL", "1")),
         "loitering_threshold": int(os.getenv("LOITERING_THRESHOLD_SECONDS", "1800")),
         "unattended_threshold": int(os.getenv("UNATTENDED_OBJECT_THRESHOLD_SECONDS", "1800")),
         "unattended_distance": int(os.getenv("UNATTENDED_DISTANCE_PIXELS", "80")),
     }
     if settings["mediamtx_api_url"] and not settings["mediamtx_api_password"]:
         raise RuntimeError("Set MEDIAMTX_API_PASSWORD when MEDIAMTX_API_URL is enabled")
+    for network in settings["camera_networks"]:
+        ipaddress.ip_network(network)
+    if settings["max_recorders"] < 1:
+        raise RuntimeError("VMS_MAX_RECORDERS must be positive; this is an admission limit, not certified capacity")
+    warn, reduce, block = settings["resource_thresholds"]
+    if not 0 < warn < reduce < block <= 100:
+        raise RuntimeError("Require 0 < resource warning < reduction < admission block <= 100")
+    if not 0 <= settings["resource_hysteresis"] < warn:
+        raise RuntimeError("Invalid resource recovery hysteresis")
+    if settings["resource_network_mbps"] < 0 or any(k not in {"cpu", "ram", "gpu", "vram", "storage", "network"} for k in settings["resource_required_metrics"]):
+        raise RuntimeError("Invalid resource monitoring configuration")
     for key in ("max_upload_bytes", "segment_seconds", "job_timeout_seconds", "ffmpeg_threads"):
         if settings[key] < 1:
             raise RuntimeError(f"{key} must be positive")
@@ -74,8 +108,22 @@ def load_settings():
         raise RuntimeError("Invalid database pool settings")
     if settings["retention_days"] < 1 or settings["retention_free_high_bytes"] < settings["min_free_bytes"]:
         raise RuntimeError("Invalid retention settings")
-    if not 1 <= settings["ai_batch_size"] <= 8 or not 1 <= settings["ai_max_cameras"] <= 256:
+    if settings["retention_cycle_seconds"] < 60:
+        raise RuntimeError("RETENTION_CYCLE_SECONDS must be at least 60")
+    if settings["recorder_mode"] not in {"single", "distributed"}:
+        raise RuntimeError("VMS_RECORDER_MODE must be single or distributed")
+    if settings["recorder_shard_total"] < 1 or not 0 <= settings["recorder_shard_index"] < settings["recorder_shard_total"]:
+        raise RuntimeError("Invalid recorder shard configuration")
+    if settings["recorder_takeover_seconds"] < 10:
+        raise RuntimeError("RECORDER_TAKEOVER_SECONDS must be at least 10")
+    if settings["ai_device"] not in {"auto", "cpu", "cuda"}:
+        raise RuntimeError("AI_DEVICE must be auto, cpu, or cuda")
+    if not 0 <= settings["ai_gpu_memory_fraction"] <= 1:
+        raise RuntimeError("AI_GPU_MEMORY_FRACTION must be between 0 and 1")
+    if settings["ai_batch_size"] < 1 or settings["ai_max_cameras"] < 1:
         raise RuntimeError("Invalid AI batch or camera limit")
+    if settings["ai_shard_total"] < 1 or not 0 <= settings["ai_shard_index"] < settings["ai_shard_total"]:
+        raise RuntimeError("Invalid AI shard configuration")
     if min(settings["loitering_threshold"], settings["unattended_threshold"], settings["unattended_distance"]) < 1:
         raise RuntimeError("Invalid AI rule threshold")
     storage.mkdir(parents=True, exist_ok=True)

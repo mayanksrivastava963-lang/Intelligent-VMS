@@ -2,5 +2,7 @@ name: intelligent-vms
 
 services:
   mediamtx:
+    volumes:
+      - ./infrastructure/mediamtx/mediamtx.benchmark.yml:/mediamtx.yml:ro
     ports:
       - "127.0.0.1:8554:8554"

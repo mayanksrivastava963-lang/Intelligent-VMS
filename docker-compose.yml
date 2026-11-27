@@ -1,9 +1,12 @@
+# LEGACY LOCAL-DEV BACKING SERVICES ONLY.
+# Authoritative production deployment uses compose.production.yml via scripts/start.ps1.
 name: intelligent-vms
 
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=200"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -37,6 +40,7 @@ services:
     restart: unless-stopped
     environment:
       MTX_AUTHINTERNALUSERS_0_PASS: ${MEDIAMTX_API_PASSWORD:?Set MEDIAMTX_API_PASSWORD}
+      MTX_AUTHINTERNALUSERS_1_PASS: ${MEDIAMTX_MEDIA_PASSWORD:-}
       MTX_WEBRTCADDITIONALHOSTS: ${VMS_PUBLIC_HOST:-127.0.0.1}
     volumes:
       - ./infrastructure/mediamtx/mediamtx.yml:/mediamtx.yml:ro
@@ -47,6 +51,7 @@ services:
       - "8888"
       - "8889"
       - "9997"
+      - "9998"
 
 volumes:
   postgres_data:

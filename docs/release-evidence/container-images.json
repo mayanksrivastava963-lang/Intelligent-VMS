@@ -1,0 +1,62 @@
+[
+  {
+    "Id": "sha256:116207296979a14d535cb87dc13809b3797d8e5e1a6042e7158de78f3eaaa02c",
+    "RepoTags": [
+      "intelligent-vms-api:0.1.0"
+    ],
+    "RepoDigests": [
+      "intelligent-vms-api@sha256:116207296979a14d535cb87dc13809b3797d8e5e1a6042e7158de78f3eaaa02c"
+    ],
+    "Architecture": "amd64",
+    "Os": "linux",
+    "Size": 1378461218
+  },
+  {
+    "Id": "sha256:745508d7f63efe0c5a48d0881a73e9578989834a2e8a0c143b7e0b9369e433d9",
+    "RepoTags": [
+      "intelligent-vms-web:0.1.0"
+    ],
+    "RepoDigests": [
+      "intelligent-vms-web@sha256:745508d7f63efe0c5a48d0881a73e9578989834a2e8a0c143b7e0b9369e433d9"
+    ],
+    "Architecture": "amd64",
+    "Os": "linux",
+    "Size": 102539005
+  },
+  {
+    "Id": "sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe",
+    "RepoTags": [
+      "redis:7-alpine"
+    ],
+    "RepoDigests": [
+      "redis@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe"
+    ],
+    "Architecture": "amd64",
+    "Os": "linux",
+    "Size": 57976413
+  },
+  {
+    "Id": "sha256:c730bccdbc8739f8f0c13cefe9bea8b61926f599b88fa4d0d229baa91846c7bc",
+    "RepoTags": [
+      "bluenviron/mediamtx:1.21.4"
+    ],
+    "RepoDigests": [
+      "bluenviron/mediamtx@sha256:c730bccdbc8739f8f0c13cefe9bea8b61926f599b88fa4d0d229baa91846c7bc"
+    ],
+    "Architecture": "amd64",
+    "Os": "linux",
+    "Size": 85833595
+  },
+  {
+    "Id": "sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71",
+    "RepoTags": [
+      "postgres:18-alpine"
+    ],
+    "RepoDigests": [
+      "postgres@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71"
+    ],
+    "Architecture": "amd64",
+    "Os": "linux",
+    "Size": 433292731
+  }
+]
